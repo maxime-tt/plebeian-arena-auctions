@@ -98,8 +98,8 @@ ok(net0.filter((v) => v.up).length === 4, 'all four validators up');
 
 step(1, 'Seller creates a fixed-time auction');
 const cr = await c.createAuction(seller, { title: 'Test lot: 1-of-1 print', description: 'e2e', image: '', category: 'Art', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'fixed' });
-let s = await until(async () => { const st = await c.state(); return st.auctions[cr.id] && st; }, 15000, 'create');
-const A = cr.id;
+let s = await until(async () => { const st = await c.state(); return st.auctions[cr.coord] && st; }, 15000, 'create');
+const A = cr.coord; // the auction's state key is its coordinate 1440:<seller>:<d>, not the event id
 ok(s.auctions[A].status === 'open' && s.auctions[A].mode === 'fixed' && !('hardEnd' in s.auctions[A]), 'fixed-time lot open, no hard end');
 await expectReject(c.createAuction(seller, { title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'antisnipe', windowSec: 5 }), /window/, 'anti-snipe window below the minimum refused');
 await expectReject(c.createAuction(seller, { title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'dutch' }), /mode/, 'unknown auction mode refused');
@@ -182,8 +182,8 @@ const pay = await pushed(seller, b4.id, 'settle', closedSeen);
 ok(pay.outcome === 'settle' && await bal(seller) === 250, `seller's 250 pushed ${Math.round(pay.at / 1000 - s.auctions[A].endAt * 1)} s after the end · ${msTxt(pay)}`);
 
 step(7, 'Nobody can redirect a settled escrow');
-await expectReject(c.claim(alice, s.bids[b4.id], 'settle', s.params), /validators agreed|settled/, 'the winner cannot settle to itself');
-await expectReject(c.claim(seller, s.bids[b2.id], 'settle', s.params), /validators agreed|settled/, 'a losing bid cannot be settled to the seller');
+await expectReject(c.claim(alice, s.bids[b4.id], 'settle', s.params), /validators agreed|settled|spent/, 'the winner cannot settle to itself');
+await expectReject(c.claim(seller, s.bids[b2.id], 'settle', s.params), /validators agreed|settled|spent/, 'a losing bid cannot be settled to the seller');
 
 step('V', 'Slim client view (v0.3.1): no proofs, 304 when unchanged, gzip, proofs on demand');
 const v1 = await c.view([idPub(bob)]);
@@ -203,7 +203,20 @@ await expectReject(c.bidWithProofs('0'.repeat(64)), /no such bid/, '/api/bid 404
 
 step('P', 'Push (v0.4.0): blocks on demand, and /api/events says when one commits');
 {
-  const hIdle = (await c.network())[0].height;
+  // Wait for quiescence first: the close and settle txs of the previous steps (and
+  // the closer's retries) can still be landing, which is not an idle chain. Then the
+  // property under test is "an idle chain makes no blocks", measured from one.
+  // Quiescence means the height has not moved for a few consecutive samples:
+  // the close and settle txs of the previous steps (and the closer's per-lot
+  // retries) can still be landing, and that is not an idle chain.
+  let stable = 0, hIdle = (await c.network())[0].height;
+  for (let i = 0; i < 60; i++) {
+    await sleep(500);
+    const h = (await c.network())[0].height;
+    stable = h === hIdle ? stable + 1 : 0;
+    hIdle = h;
+    if (stable >= 6) break; // 3 s with no new block
+  }
   await sleep(4000);
   ok((await c.network())[0].height <= hIdle + 1, `idle chain makes no blocks (height ${hIdle})`);
   const ac = new AbortController();
@@ -244,16 +257,16 @@ const bad = await upgrade('/mint/v1/info');
 // 400 from the gateway; behind nginx the headers are stripped first, so a plain answer
 ok(bad.status !== 101, `no upgrade off /v1/ws (${bad.status})`);
 
-step(8, 'Anti-snipe lot: every bid in the last 15 s puts the clock back to 15 s');
+step(8, 'Anti-snipe lot: every bid in the last 60 s puts the clock back to 60 s');
 await c.j('/api/admin/validator/4/start', { method: 'POST' });
-const cb = await c.createAuction(seller, { title: 'Anti-snipe probe', description: '', image: '', category: 'Art', startPrice: 100, minIncrement: 10, durationSec: 20, mode: 'antisnipe', windowSec: 15 });
-let sb = await until(async () => { const st = await c.state(); return st.auctions[cb.id] && st; }, 15000, 'create anti-snipe');
-const B = cb.id, endB0 = sb.auctions[B].endAt;
-ok(sb.auctions[B].mode === 'antisnipe' && sb.auctions[B].windowSec === 15, 'anti-snipe lot open, window 15 s');
-await until(async () => endB0 - Date.now() / 1000 < 12, 30000, 'inside the window');
+const cb = await c.createAuction(seller, { title: 'Anti-snipe probe', description: '', image: '', category: 'Art', startPrice: 100, minIncrement: 10, durationSec: 20, mode: 'antisnipe', windowSec: 60 });
+let sb = await until(async () => { const st = await c.state(); return st.auctions[cb.coord] && st; }, 15000, 'create anti-snipe');
+const B = cb.coord, endB0 = sb.auctions[B].endAt;
+ok(sb.auctions[B].mode === 'antisnipe' && sb.auctions[B].windowSec === 60, 'anti-snipe lot open, window 60 s');
+await until(async () => endB0 - Date.now() / 1000 < 60, 10000, 'inside the window');
 const x1 = await placeBid(bob, B, 100);
 const ltB = Number(JSON.parse(x1.state.bids[x1.id].proofs[0].secret)[1].tags.find((tg) => tg[0] === 'locktime')[1]);
-ok(x1.state.bids[x1.id].extended && Math.abs(x1.state.auctions[B].endAt - (x1.state.bids[x1.id].time + 15)) <= 0, `bid with ${(endB0 - x1.state.bids[x1.id].time)} s left reset the clock to 15 s`);
+ok(x1.state.bids[x1.id].extended && Math.abs(x1.state.auctions[B].endAt - (x1.state.bids[x1.id].time + 60)) <= 0, `bid with ${(endB0 - x1.state.bids[x1.id].time)} s left reset the clock to 60 s`);
 ok(ltB >= x1.state.auctions[B].endAt + sb.params.settlementSafetySec + sb.params.bidToConsensusLatencySec, 'anti-snipe escrow locked past the NEW end + settlement_safety + latency (check-order amendment, spec §2.2)');
 await sleep(6000);
 t = Date.now();
@@ -265,8 +278,8 @@ ok(await bal(bob) === 1000, `Bob's 100 pushed back · ${msTxt(px)}`);
 const forged = bytesToHex(schnorr.sign(new Uint8Array(32).fill(1), hexToBytes(alice.walletSk)));
 const fx = await c.rawRelease((await c.bidWithProofs(x2.id)), [forged], sb.params);
 ok(!fx.body.signatures, `mint rejects a signature not made by the group key -> "${String(fx.body.detail).slice(0, 60)}"`);
-sb = await until(async () => { const st = await c.state(); return st.auctions[B].status === 'closed' && st; }, 60000, 'anti-snipe close');
-ok(sb.auctions[B].winner === x2.id && !sb.auctions[B].expired, 'closed 15 s after the last bid; Alice wins');
+sb = await until(async () => { const st = await c.state(); return st.auctions[B].status === 'closed' && st; }, 90000, 'anti-snipe close');
+ok(sb.auctions[B].winner === x2.id && !sb.auctions[B].expired, 'closed 60 s after the last bid; Alice wins');
 const pay2 = await pushed(seller, x2.id, 'anti-snipe settle', Date.now());
 ok(await bal(seller) === 360, `seller's 110 pushed · ${msTxt(pay2)}`);
 
