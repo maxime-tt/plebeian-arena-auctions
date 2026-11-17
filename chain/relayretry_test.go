@@ -143,21 +143,22 @@ func TestObserverRetriesTransientSubmitFailure(t *testing.T) {
 	}
 }
 
-// TestObserverDropsTerminalRejection: a terminal CheckTx rejection is an answer.
-// The event must be dropped (never retried), the failure recorded, and the
-// cursor advanced past it so a restart does not re-read it forever.
+// TestObserverDropsTerminalRejection: a failure that is neither a transport
+// refusal nor an application rejection is an answer with no retry value, so the
+// event is dropped on the FIRST attempt, the failure is recorded, and the cursor
+// advances past it.
+//
+// The shape is the RPC result path's ("CheckTx rejected: <log>").  CometBFT
+// v1.0.1 routes a non-zero CheckTx code through the error object instead
+// (mempool/clist_mempool.go:338 returns ErrInvalidTx), so this pins the
+// defensive branch; an application rejection that carries a code is retried up
+// to maxAppRetries and is covered by TestObserverDropsAppRejectionAfterTheCap.
 func TestObserverDropsTerminalRejection(t *testing.T) {
 	secret := nostr.GeneratePrivateKey()
 	event := signedCreate(t, secret, "Terminal drop", 1_800_000_200)
 
 	submitter := NewMemorySubmitter()
-	// The real shape, as the RPC layer now builds it: appRejectionCode reads a
-	// non-zero code out of the broadcast message, so the failure reaches the
-	// observer as terminal and must never be retried.
-	if appRejectionCode(appRejectedBroadcast) == 0 {
-		t.Fatal("appRejectionCode must read the application code out of the broadcast message")
-	}
-	submitter.FailAlways(event.ID, &SubmitFailure{Message: "broadcast rejected: " + appRejectedBroadcast})
+	submitter.FailAlways(event.ID, &SubmitFailure{Message: "CheckTx rejected: unsupported kind 9999"})
 
 	cursor := newFakeCursor()
 	observer, err := NewObserver(ObserverConfig{URL: "ws://drop.example", Submitter: submitter, Cursor: cursor, Logger: quietLogger()})
@@ -285,6 +286,9 @@ func TestRPCSubmitterAppRejectionIsTerminal(t *testing.T) {
 	if IsTransientSubmit(err) {
 		t.Fatalf("app rejection classified transient (it would be retried forever): %v", err)
 	}
+	if !IsAppRejection(err) {
+		t.Fatalf("IsAppRejection(%v) = false, want true", err)
+	}
 	var failure *SubmitFailure
 	if !errors.As(err, &failure) {
 		t.Fatalf("err = %v (%T), want a *SubmitFailure", err, err)
@@ -310,6 +314,128 @@ func TestRPCSubmitterCatchingUpIsTransient(t *testing.T) {
 	}
 	if !IsTransientSubmit(err) {
 		t.Fatalf("catching-up refusal classified terminal: %v", err)
+	}
+}
+
+// appRejectedUnknownAuction is the real shape of an application rejection that
+// the next block fixes: CheckTx runs against committed state, so a bid published
+// before its create's block commits gets this and succeeds one block later.
+const appRejectedUnknownAuction = "broadcast error on transaction validation: tx AB is invalid: code=2, data=, log='unknown auction', codespace=''"
+
+// TestObserverRetriesAppRejectionUntilTheCreateCommits: an application rejection
+// is retried, so a bid that arrives before its create's block still commits.
+func TestObserverRetriesAppRejectionUntilTheCreateCommits(t *testing.T) {
+	secret := nostr.GeneratePrivateKey()
+	event := signedCreate(t, secret, "Race resolves", 1_800_000_800)
+
+	submitter := NewMemorySubmitter()
+	// The receive loop's attempt and the worker's first retry fail; the third
+	// attempt (one block later) succeeds.
+	submitter.FailTimes(event.ID, &SubmitFailure{Message: "broadcast rejected: " + appRejectedUnknownAuction}, 2)
+
+	cursor := newFakeCursor()
+	observer, err := NewObserver(ObserverConfig{URL: "ws://race.example", Submitter: submitter, Cursor: cursor, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observer.RunRetriesForTest(ctx)
+
+	observer.HandleForTest(ctx, &event)
+
+	waitFor(t, 5*time.Second, func() bool { return len(submitter.Submissions()) == 1 },
+		"the app-rejected event to commit once the create landed")
+	if dropped := observer.Dropped(); dropped != 0 {
+		t.Fatalf("dropped = %d, want 0: the rejection was not permanent", dropped)
+	}
+	if attempts := submitter.Attempts(event.ID); attempts != 3 {
+		t.Fatalf("attempts = %d, want 3 (two rejections then a commit)", attempts)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		since, id := cursor.since("ws://race.example")
+		return since.Unix() == int64(event.CreatedAt) && id == event.ID
+	}, "the cursor to advance once, after the commit")
+	if advanced := cursor.advanced(); len(advanced) != 1 || advanced[0] != event.ID {
+		t.Fatalf("cursor advances = %v, want exactly [%s]", advanced, event.ID)
+	}
+}
+
+// TestObserverDropsAppRejectionAfterTheCap: an application rejection that never
+// stops is dropped after maxAppRetries attempts, not retried forever, and the
+// cursor moves past it.
+func TestObserverDropsAppRejectionAfterTheCap(t *testing.T) {
+	secret := nostr.GeneratePrivateKey()
+	event := signedCreate(t, secret, "Permanent rejection", 1_800_000_900)
+
+	submitter := NewMemorySubmitter()
+	submitter.FailAlways(event.ID, &SubmitFailure{Message: "broadcast rejected: " + appRejectedUnknownAuction})
+
+	cursor := newFakeCursor()
+	observer, err := NewObserver(ObserverConfig{URL: "ws://cap.example", Submitter: submitter, Cursor: cursor, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observer.RunRetriesForTest(ctx)
+
+	observer.HandleForTest(ctx, &event)
+
+	// maxAppRetries counts the receive loop's attempt, so this costs the default
+	// backoff sequence 250 ms + 500 ms + 1 s + 2 s = 3.75 s.
+	waitFor(t, 15*time.Second, func() bool { return observer.Dropped() == 1 },
+		"the app rejection to be dropped after the cap")
+	if attempts := submitter.Attempts(event.ID); attempts != maxAppRetries {
+		t.Fatalf("attempts = %d, want exactly maxAppRetries = %d", attempts, maxAppRetries)
+	}
+	if committed, _, _ := observer.Stats(); committed != 0 {
+		t.Fatalf("committed = %d, want 0 for a permanently rejected event", committed)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		since, id := cursor.since("ws://cap.example")
+		return since.Unix() == int64(event.CreatedAt) && id == event.ID
+	}, "the cursor to advance past the dropped event")
+
+	// No further attempts after the drop.
+	time.Sleep(300 * time.Millisecond)
+	if attempts := submitter.Attempts(event.ID); attempts != maxAppRetries {
+		t.Fatalf("attempts = %d after the drop, want %d", attempts, maxAppRetries)
+	}
+}
+
+// TestObserverTransportFailureIsNotCapped: a transport refusal says nothing
+// about the transaction (the node is simply not ready), so it is retried without
+// limit -- the handover §2 "chain is down for minutes" case.
+func TestObserverTransportFailureIsNotCapped(t *testing.T) {
+	secret := nostr.GeneratePrivateKey()
+	event := signedCreate(t, secret, "Transport uncapped", 1_800_001_000)
+
+	submitter := NewMemorySubmitter()
+	submitter.FailTimes(event.ID, &SubmitFailure{Transient: true, Message: "broadcast rejected: " + catchingUpBroadcast}, maxAppRetries+3)
+
+	cursor := newFakeCursor()
+	observer, err := NewObserver(ObserverConfig{
+		URL: "ws://transport.example", Submitter: submitter, Cursor: cursor, Logger: quietLogger(),
+		// A small backoff: this test is about the attempt count, not the timing.
+		RetryBackoff: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observer.RunRetriesForTest(ctx)
+
+	observer.HandleForTest(ctx, &event)
+
+	waitFor(t, 10*time.Second, func() bool { return len(submitter.Submissions()) == 1 },
+		"the event to commit after more transport failures than the app cap")
+	if dropped := observer.Dropped(); dropped != 0 {
+		t.Fatalf("dropped = %d, want 0: a transport refusal must never be capped", dropped)
+	}
+	if attempts := submitter.Attempts(event.ID); attempts != maxAppRetries+4 {
+		t.Fatalf("attempts = %d, want %d (%d failures then a commit)", attempts, maxAppRetries+4, maxAppRetries+3)
 	}
 }
 

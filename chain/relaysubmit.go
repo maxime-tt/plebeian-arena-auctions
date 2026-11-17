@@ -92,6 +92,27 @@ func IsTransientSubmit(err error) bool {
 	return false
 }
 
+// IsAppRejection reports whether err carries a *SubmitFailure whose message is
+// the application's own rejection (a CheckTx code in the CometBFT broadcast
+// error).  Like IsTransientSubmit it walks the whole wrap chain.
+//
+// Such a refusal is deterministic for the committed state the node had when it
+// answered, but that state moves: a bid or supersession that arrives before its
+// create's block has committed is rejected with "unknown auction" or "update
+// must reference the auction root" and succeeds one block later.  So it is
+// worth retrying -- but only a bounded number of times, unlike a transport
+// refusal, which says nothing about the transaction and is retried without
+// limit.
+func IsAppRejection(err error) bool {
+	for err != nil {
+		if failure, ok := err.(*SubmitFailure); ok && appRejectionCode(failure.Message) != 0 {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
 // SubmitResult mirrors what the HTTP /api/tx path already reports back: the
 // height the transaction landed at and the application code.  A caller can log
 // it and a test can assert on it.
@@ -293,24 +314,34 @@ type MemorySubmitter struct {
 	mu          sync.Mutex
 	submissions []Event
 	failures    map[string]error
+	remaining   map[string]int
 	always      map[string]error
 	attempts    map[string]int
 }
 
 func NewMemorySubmitter() *MemorySubmitter {
 	return &MemorySubmitter{
-		failures: map[string]error{},
-		always:   map[string]error{},
-		attempts: map[string]int{},
+		failures:  map[string]error{},
+		remaining: map[string]int{},
+		always:    map[string]error{},
+		attempts:  map[string]int{},
 	}
 }
 
 // FailEvery makes the submitter return err for the named event, once.  A later
 // attempt at the same event succeeds, so it exercises "retry once and commit".
 func (submitter *MemorySubmitter) FailEvery(eventID string, err error) {
+	submitter.FailTimes(eventID, err, 1)
+}
+
+// FailTimes makes the submitter return err for the next n attempts at the named
+// event, then succeed.  It models a refusal the next block fixes (a bid that
+// arrived before its create's block committed).
+func (submitter *MemorySubmitter) FailTimes(eventID string, err error, times int) {
 	submitter.mu.Lock()
 	defer submitter.mu.Unlock()
 	submitter.failures[eventID] = err
+	submitter.remaining[eventID] = times
 }
 
 // FailAlways makes the submitter return err for the named event on every
@@ -327,6 +358,7 @@ func (submitter *MemorySubmitter) ClearFailures(eventID string) {
 	submitter.mu.Lock()
 	defer submitter.mu.Unlock()
 	delete(submitter.failures, eventID)
+	delete(submitter.remaining, eventID)
 	delete(submitter.always, eventID)
 }
 
@@ -345,9 +377,9 @@ func (submitter *MemorySubmitter) SubmitEvent(_ context.Context, event Event) (S
 	if err, ok := submitter.always[event.ID]; ok {
 		return SubmitResult{}, err
 	}
-	if err, ok := submitter.failures[event.ID]; ok {
-		delete(submitter.failures, event.ID)
-		return SubmitResult{}, err
+	if remaining := submitter.remaining[event.ID]; remaining > 0 {
+		submitter.remaining[event.ID] = remaining - 1
+		return SubmitResult{}, submitter.failures[event.ID]
 	}
 	submitter.submissions = append(submitter.submissions, event)
 	return SubmitResult{Height: int64(len(submitter.submissions)), TxHash: event.ID}, nil

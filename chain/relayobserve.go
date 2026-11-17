@@ -73,6 +73,10 @@ type ObserverConfig struct {
 	Cursor CursorRecorder
 	// ReconnectDelay is how long to wait before retrying a dropped connection.
 	ReconnectDelay time.Duration
+	// RetryBackoff is the first delay before retrying a refused submit; it
+	// doubles up to retryBackoffMax.  Zero means retryBackoff.  Tests set it
+	// small so a path that needs many retries does not cost wall-clock seconds.
+	RetryBackoff time.Duration
 	// OnSubmit, when set, is called after a successful submission.  It must not
 	// block.
 	OnSubmit func(event Event, result SubmitResult)
@@ -125,6 +129,9 @@ func NewObserver(config ObserverConfig) (*Observer, error) {
 	if config.ReconnectDelay <= 0 {
 		config.ReconnectDelay = time.Second
 	}
+	if config.RetryBackoff <= 0 {
+		config.RetryBackoff = retryBackoff
+	}
 	if config.Logger == nil {
 		config.Logger = log.Default()
 	}
@@ -144,13 +151,30 @@ const (
 	retryBackoffMax = 5 * time.Second
 )
 
+// maxAppRetries bounds how many times an application rejection is submitted
+// before the event is dropped, counting the receive loop's first attempt.  The
+// refusal is deterministic for the committed state the node had when it
+// answered, and that state moves: a bid or supersession published before its
+// create's block commits is rejected with "unknown auction" or "update must
+// reference the auction root" and succeeds one block later.  The default
+// backoff sequence (250 ms, 500 ms, 1 s, 2 s) covers ~3.75 s, comfortably more
+// than one block, so the race resolves; an event the chain keeps rejecting is
+// dropped after that instead of being retried forever.
+const maxAppRetries = 5
+
+// retryItem is one queued event and how many submit attempts it has cost.
+type retryItem struct {
+	event    Event
+	attempts int
+}
+
 // retryQueue is an unbounded, arrival-ordered FIFO of events awaiting retry,
 // de-duplicated by id so a relay replay cannot queue a second copy.  next blocks
 // until an item is queued or ctx is done; it is not a channel so the receive
 // loop never blocks on a full buffer.
 type retryQueue struct {
 	mu    sync.Mutex
-	items []Event
+	items []retryItem
 	ids   map[string]struct{}
 	wake  chan struct{}
 }
@@ -160,6 +184,8 @@ func newRetryQueue() *retryQueue {
 }
 
 // push appends the event unless its id is already queued, then wakes the worker.
+// The item starts at one attempt because the receive loop has already made the
+// first one.
 func (queue *retryQueue) push(event Event) {
 	queue.mu.Lock()
 	if _, queued := queue.ids[event.ID]; queued {
@@ -167,37 +193,37 @@ func (queue *retryQueue) push(event Event) {
 		return
 	}
 	queue.ids[event.ID] = struct{}{}
-	queue.items = append(queue.items, event)
+	queue.items = append(queue.items, retryItem{event: event, attempts: 1})
 	queue.mu.Unlock()
 	queue.signal()
 }
 
 // pushFront puts an event a worker took but could not finish back at the head,
-// preserving arrival order across a cancelled worker.
-func (queue *retryQueue) pushFront(event Event) {
+// preserving arrival order and its attempt count across a cancelled worker.
+func (queue *retryQueue) pushFront(item retryItem) {
 	queue.mu.Lock()
-	if _, queued := queue.ids[event.ID]; !queued {
-		queue.ids[event.ID] = struct{}{}
-		queue.items = append([]Event{event}, queue.items...)
+	if _, queued := queue.ids[item.event.ID]; !queued {
+		queue.ids[item.event.ID] = struct{}{}
+		queue.items = append([]retryItem{item}, queue.items...)
 	}
 	queue.mu.Unlock()
 	queue.signal()
 }
 
 // next blocks until an event is queued or ctx is done.
-func (queue *retryQueue) next(ctx context.Context) (Event, bool) {
+func (queue *retryQueue) next(ctx context.Context) (retryItem, bool) {
 	for {
 		queue.mu.Lock()
 		if len(queue.items) > 0 {
-			event := queue.items[0]
+			item := queue.items[0]
 			queue.items = queue.items[1:]
 			queue.mu.Unlock()
-			return event, true
+			return item, true
 		}
 		queue.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return Event{}, false
+			return retryItem{}, false
 		case <-queue.wake:
 		}
 	}
@@ -217,7 +243,11 @@ func (queue *retryQueue) drain() []Event {
 	queue.items = nil
 	queue.ids = map[string]struct{}{}
 	queue.mu.Unlock()
-	return items
+	events := make([]Event, 0, len(items))
+	for _, item := range items {
+		events = append(events, item.event)
+	}
+	return events
 }
 
 func (queue *retryQueue) signal() {
@@ -263,36 +293,46 @@ func (observer *Observer) retryWorker(ctx context.Context) {
 		observer.mu.Unlock()
 	}()
 	for {
-		event, ok := observer.queue.next(ctx)
+		item, ok := observer.queue.next(ctx)
 		if !ok {
 			return
 		}
-		backoff := retryBackoff
+		backoff := observer.config.RetryBackoff
 		for {
 			// The initial attempt already happened in handle; every retry here
-			// waits first, starting at 250 ms and doubling to the 5 s cap.
+			// waits first, starting at RetryBackoff and doubling to the 5 s cap.
 			select {
 			case <-ctx.Done():
-				observer.queue.pushFront(event)
+				observer.queue.pushFront(item)
 				return
 			case <-time.After(backoff):
 			}
-			result, err := observer.config.Submitter.SubmitEvent(ctx, event)
+			item.attempts++
+			result, err := observer.config.Submitter.SubmitEvent(ctx, item.event)
 			if err == nil {
-				observer.queue.done(event.ID)
-				observer.committed(event, result, true)
+				observer.queue.done(item.event.ID)
+				observer.committed(item.event, result, true)
 				break
 			}
-			if !IsTransientSubmit(err) {
-				observer.queue.done(event.ID)
-				observer.droppedEvent(event, err, true)
+			appRejection := IsAppRejection(err)
+			if !IsTransientSubmit(err) && !appRejection {
+				observer.queue.done(item.event.ID)
+				observer.droppedEvent(item.event, err, true)
 				break
 			}
-			observer.recordError(fmt.Errorf("submit %s: %w", event.ID, err))
+			if appRejection && item.attempts >= maxAppRetries {
+				// The application has answered this many times; the state that
+				// would change its mind has not moved, so stop.
+				observer.queue.done(item.event.ID)
+				observer.config.Logger.Printf("relay observer: dropping %s after %d attempts: %v", item.event.ID, item.attempts, err)
+				observer.droppedEvent(item.event, err, true)
+				break
+			}
+			observer.recordError(fmt.Errorf("submit %s: %w", item.event.ID, err))
 			if backoff *= 2; backoff > retryBackoffMax {
 				backoff = retryBackoffMax
 			}
-			observer.config.Logger.Printf("relay observer: retrying %s in %s: %v", event.ID, backoff, err)
+			observer.config.Logger.Printf("relay observer: retrying %s in %s: %v", item.event.ID, backoff, err)
 		}
 	}
 }
@@ -414,7 +454,10 @@ func (observer *Observer) handle(ctx context.Context, event *nostr.Event) {
 	result, err := observer.config.Submitter.SubmitEvent(ctx, signed)
 	if err != nil {
 		observer.recordError(fmt.Errorf("submit %s: %w", event.ID, err))
-		if IsTransientSubmit(err) {
+		// An application rejection is queued too: the committed state it was
+		// decided against may move (a bid published before its create's block),
+		// so the worker retries it a bounded number of times.
+		if IsTransientSubmit(err) || IsAppRejection(err) {
 			if observer.workerRunning() {
 				// Keep the id in seenIDs: the event is queued, and a relay
 				// replay of it must not queue a second copy.  The retry worker
