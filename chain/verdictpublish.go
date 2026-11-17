@@ -1,10 +1,20 @@
 package main
 
 // The publish driver.  It reads the validator's COMMITTED snapshot and writes
-// two event classes back to the relay:
+// four event classes back to the relay:
 //
-//   - a state commitment (kind 1447) every StateCommitEvery blocks, and
-//     whenever a verdict is published (a meaningful change);
+//   - a state pulse (kind 21447, EPHEMERAL) on EVERY pass, so a live subscriber
+//     can place the chain's clock even while nothing happens.  A pulse the
+//     relay drops for having no listener is a non-event (owner ruling, handover
+//     §8.1): it is not retried, not logged as an error and gates nothing;
+//   - a state commitment (kind 1447, STORED) whenever a verdict is published, on
+//     the first pass, whenever the committed HEIGHT MOVES, and on the
+//     StateCommitMaxInterval heartbeat when the chain is otherwise idle -- so
+//     the committed clock can never go stale by more than that wall-clock gap
+//     (handover §1).  This is the anchor that proves a chain of time;
+//   - a params event (kind 1448, STORED) when the escrow terms change or on the
+//     Publisher.every block cadence, anchored to the SAME (height, app_hash) as
+//     the commitment published in the same pass (handover §4);
 //   - a verdict (kind 1445) for each auction the chain has CLOSED.
 //
 // THE ONE RULE THAT SHAPES THIS FILE: a claim is published only AFTER the block
@@ -34,6 +44,7 @@ import (
 	"encoding/json"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,7 +55,7 @@ import (
 // ordering on it: every verdict record carries the committed height it acted
 // at, so "published after commit" is checkable rather than merely claimed.
 type PublishRecord struct {
-	Op              string // "state_commitment" | "verdict" | "refused"
+	Op              string // "state_commitment" | "state_pulse" | "params" | "verdict" | "refused"
 	CommittedHeight int64  // the app's committed height when Step ran
 	Height          int64  // the anchor height on the event
 	Hash            string // the anchor hash on the event
@@ -69,9 +80,16 @@ type PublisherConfig struct {
 	// height.  ok=false means that height's hash is not readable yet -- the
 	// publisher then refuses to anchor anything to it and retries later.
 	BlockHash func(height int64) (hash string, ok bool)
-	// Every is the state-commitment cadence in blocks.  Zero means
-	// StateCommitEvery.
+	// Every is the PARAMS-event cadence in blocks (kind 1448 is re-published
+	// every N blocks even without a change).  Zero means StateCommitEvery.  It
+	// is no longer the state-commitment gate: the commitment is gated on a
+	// verdict, the first pass, a height move or the MaxInterval heartbeat.
 	Every int64
+	// MaxInterval is the maximum WALL-CLOCK gap between two stored state
+	// commitments.  Blocks are produced on demand, so a block-height cadence has
+	// no wall-time bound; this bounds how stale the committed clock can get on an
+	// idle chain.  Zero or negative means StateCommitMaxInterval.
+	MaxInterval time.Duration
 	// Now is the event timestamp source.  Nil means time.Now.
 	Now func() int64
 	// Logger receives progress; nil means log.Default.
@@ -80,18 +98,21 @@ type PublisherConfig struct {
 
 // Publisher is the write half of the Nostr transport for one validator.
 type Publisher struct {
-	key       *btcec.PrivateKey
-	relay     RelayWriter
-	app       *App
-	blockHash func(height int64) (string, bool)
-	every     int64
-	now       func() int64
-	log       *log.Logger
+	key         *btcec.PrivateKey
+	relay       RelayWriter
+	app         *App
+	blockHash   func(height int64) (string, bool)
+	every       int64
+	maxInterval time.Duration
+	now         func() int64
+	log         *log.Logger
 
-	mu         sync.Mutex
-	published  map[string]bool // auction id -> a verdict has been published
-	lastCommit int64           // committed height of the last commitment published
-	records    []PublishRecord
+	mu               sync.Mutex
+	published        map[string]bool // auction id -> a verdict has been published
+	lastCommitHeight int64           // committed height of the last commitment published
+	lastCommitTime   int64           // unix seconds (p.now) of the last commitment published
+	lastParams       string          // params digest of the last params event published
+	records          []PublishRecord
 }
 
 // NewPublisher validates config and returns a publisher.
@@ -112,6 +133,10 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	if every <= 0 {
 		every = StateCommitEvery
 	}
+	maxInterval := cfg.MaxInterval
+	if maxInterval <= 0 {
+		maxInterval = StateCommitMaxInterval
+	}
 	now := cfg.Now
 	if now == nil {
 		now = func() int64 { return time.Now().Unix() }
@@ -122,7 +147,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	}
 	return &Publisher{
 		key: cfg.Key, relay: cfg.Relay, app: cfg.App, blockHash: cfg.BlockHash,
-		every: every, now: now, log: logger,
+		every: every, maxInterval: maxInterval, now: now, log: logger,
 		published: map[string]bool{},
 	}, nil
 }
@@ -167,18 +192,35 @@ func (p *Publisher) Step(ctx context.Context) {
 	// 1. Verdicts first: each one is a "meaningful change".
 	publishedVerdict := p.publishVerdicts(ctx, state, height)
 
-	// 2. State commitment: on cadence, or whenever a verdict just went out, or
-	//    the first time we ever publish (proves the write path works).
+	appHashHex := hexOrEmpty(appHash)
+	now := p.now()
+
+	// 2. Pulse: UNCONDITIONAL, on every pass, so a live subscriber always has
+	//    the chain's clock.  It is ephemeral and gates nothing.
+	if appHashHex != "" {
+		p.publishPulse(ctx, height, appHashHex, now)
+	}
+
+	// 3. Params: publish when the terms CHANGE, and on the block cadence so a
+	//    long-lived chain refreshes them even without a change (handover §4).
+	digest := paramsVersion(state.Params)
 	p.mu.Lock()
-	needCommit := height%p.every == 0 || publishedVerdict || p.lastCommit == 0
+	needParams := p.lastParams == "" || digest != p.lastParams || height%p.every == 0
+	// 4. Stored commitment gate: a verdict went out, the first ever publish, the
+	//    committed height moved, the heartbeat elapsed, or params need an anchor
+	//    to ride.  The heartbeat is the point of the change: blocks are produced
+	//    on demand, so a block-height cadence alone has no wall-time bound.
+	needCommit := publishedVerdict || p.lastCommitTime == 0 || height != p.lastCommitHeight ||
+		now-p.lastCommitTime >= int64(p.maxInterval/time.Second) || needParams
 	p.mu.Unlock()
+
+	if (needCommit || needParams) && appHashHex == "" {
+		p.record(PublishRecord{Op: "refused", CommittedHeight: height, Reason: "app_hash_empty"})
+		return
+	}
+
 	if needCommit {
-		appHashHex := hexOrEmpty(appHash)
-		if appHashHex == "" {
-			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Reason: "app_hash_empty"})
-			return
-		}
-		ev, err := BuildStateCommitmentEvent(p.key, height, appHashHex, p.now())
+		ev, err := BuildStateCommitmentEvent(p.key, height, appHashHex, now)
 		if err != nil {
 			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Reason: err.Error()})
 			return
@@ -188,11 +230,69 @@ func (p *Publisher) Step(ctx context.Context) {
 			rec.Error = err.Error()
 		} else {
 			p.mu.Lock()
-			p.lastCommit = height
+			p.lastCommitHeight = height
+			p.lastCommitTime = now
 			p.mu.Unlock()
 		}
 		p.record(rec)
 	}
+
+	// 5. Params ride the SAME (height, app_hash) as the commitment just
+	//    published in this pass, so a client can tell they belong together.
+	//    A failed publish leaves lastParams unchanged, so it retries.
+	if needParams {
+		ev, err := BuildParamsEvent(p.key, state.Params, height, appHashHex, now)
+		if err != nil {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Reason: err.Error()})
+			return
+		}
+		rec := PublishRecord{Op: "params", CommittedHeight: height, Height: height, Hash: appHashHex}
+		if err := p.relay.Publish(ctx, ev); err != nil {
+			rec.Error = err.Error()
+		} else {
+			p.mu.Lock()
+			p.lastParams = digest
+			p.mu.Unlock()
+		}
+		p.record(rec)
+	}
+}
+
+// publishPulse publishes this pass's ephemeral heartbeat (kind 21447).  It is
+// best-effort by design: the event is EPHEMERAL, so the relay drops it when
+// nobody is subscribed, and a pulse nobody could have received is a non-event,
+// not a failure.  That "mute: no one was listening for this" answer is the
+// relay's implementation choice for an ephemeral event with no listener
+// (handover §8.1 correction 3): it is swallowed here -- no record, no retry, no
+// error log -- and gates nothing.  Any OTHER failure is recorded so a real
+// transport problem stays visible.
+func (p *Publisher) publishPulse(ctx context.Context, height int64, appHashHex string, now int64) {
+	ev, err := BuildStatePulseEvent(p.key, height, appHashHex, now)
+	if err != nil {
+		p.record(PublishRecord{Op: "refused", CommittedHeight: height, Reason: err.Error()})
+		return
+	}
+	rec := PublishRecord{Op: "state_pulse", CommittedHeight: height, Height: height, Hash: appHashHex}
+	if err := p.relay.Publish(ctx, ev); err != nil {
+		if noListenerError(err) {
+			return
+		}
+		rec.Error = err.Error()
+	}
+	p.record(rec)
+}
+
+// noListenerError reports whether a publish failure is the relay's "nobody is
+// subscribed" answer to an ephemeral event rather than a transport failure.
+// The deployment's relay (khatru) answers an ephemeral event with no live
+// subscription with "mute: no one was listening for this"; a pulse lost that
+// way costs nothing, so it must not be retried or alarmed on.
+func noListenerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no one was listening") || strings.Contains(msg, "mute")
 }
 
 // publishVerdicts publishes one verdict per newly-closed auction, anchored to

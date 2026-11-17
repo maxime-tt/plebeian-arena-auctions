@@ -20,13 +20,26 @@ type Event struct {
 
 // The auction kind map: the 1440 series, one place only (merged protocol spec
 // §7). All are REGULAR kinds (1000 <= n < 10000 per NIP-01), never the
-// NIP-01 ephemeral range: khatru (nak serve) refuses an ephemeral event with
-// no matching live subscription and does not buffer it, so an ephemeral kind
-// would silently drop auction traffic. KindChat (1442) is his and ours uses it
-// for nothing; it is kept only so a chat event stays recognisable by name.
+// NIP-01 ephemeral range: khatru — the relay inside the Plebeian Market
+// repository, the one this deployment runs — refuses an ephemeral event with
+// no matching live subscription ("mute: no one was listening for this") and
+// does not buffer it, so an ephemeral kind would silently drop auction
+// traffic. KindChat (1442) is his and ours uses it for nothing; it is kept
+// only so a chat event stays recognisable by name.
+//
+// THE ONE DELIBERATE EXCEPTION IS THE STATE PULSE (KindStatePulse). It is a
+// HEARTBEAT, not auction traffic: nothing a client acts on depends on any
+// single pulse, so its loss costs nothing and it is ephemeral by design
+// (NIP-01 20000-29999), published unconditionally and dropped without ceremony
+// when nobody is subscribed (owner ruling, handover §8.1). The rules never
+// rest on a pulse: the STORED anchor stays KindStateCommit (1447), which
+// proves a chain of time, while the pulse is only the fast clock. A bid's
+// confirmation is the block commit of the bid event — a normal stored event —
+// and is never carried by the pulse.
 //
 // These numbers live here and nowhere else — never as literals through the
-// tree. TestKindMapIsRegularRange pins the whole series to the regular range.
+// tree. TestKindMapIsRegularRange pins the whole series to the regular range
+// and names the pulse as its explicit, documented exception.
 const (
 	KindCreate       = 1440 // create / root: the auction listing and its supersessions
 	KindBid          = 1441 // bid
@@ -35,7 +48,14 @@ const (
 	KindSettle       = 1444 // settle
 	KindOutcome      = 1445 // outcome / validator verdict
 	KindFundingAbort = 1446 // funding abort
-	KindStateCommit  = 1447 // state commitment
+	KindStateCommit  = 1447 // state commitment: the STORED anchor that proves a chain of time
+	KindParams       = 1448 // state params: the escrow terms committed in the app hash the event names
+	// KindStatePulse is the ephemeral heartbeat twin of the 1447 commitment: a
+	// (height, app_hash, time) tick published on every publish pass so a live
+	// subscriber can place the chain's clock. NIP-01 EPHEMERAL (20000-29999):
+	// the relay forwards it to subscribers and stores nothing, so a dropped
+	// pulse is a non-event, never a retry.
+	KindStatePulse = 21447
 )
 
 // AuctionKinds is the exported map of the whole series, so a reader (or a
@@ -49,11 +69,19 @@ var AuctionKinds = map[string]int{
 	"outcome":       KindOutcome,
 	"funding_abort": KindFundingAbort,
 	"state_commit":  KindStateCommit,
+	"params":        KindParams,
+	"state_pulse":   KindStatePulse,
 }
 
 // regularKind: NIP-01's regular range, where relays are expected to STORE the
 // event. The auction series must stay inside it (spec §7).
 func regularKind(k int) bool { return k >= 1000 && k < 10000 }
+
+// ephemeralKind: NIP-01's ephemeral range, where a relay is expected to relay
+// the event to live subscribers only and NOT store it. Only the state pulse
+// (a heartbeat) belongs here; every stored kind in the series must stay
+// regular.
+func ephemeralKind(k int) bool { return k >= 20000 && k < 30000 }
 
 func nostrStr(sb *strings.Builder, s string) {
 	sb.WriteByte('"')

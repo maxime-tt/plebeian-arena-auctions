@@ -231,6 +231,7 @@ func cmdNode(args []string) {
 	retain := fs.Int64("retain-blocks", 100000, "prune blocks more than N below the newest snapshot (0: keep every block)")
 	var relays relayURLs
 	fs.Var(&relays, "relay", "relay websocket URL: ingests auction events from it and publishes verdicts and state commitments to it (repeatable)")
+	commitMax := fs.Duration("commit-max-interval", StateCommitMaxInterval, "maximum wall-clock gap between state commitments")
 	fs.Parse(args)
 	if *every < 0 || *retain < 0 {
 		log.Fatal("-snapshot-every and -retain-blocks must be >= 0")
@@ -284,7 +285,7 @@ func cmdNode(args []string) {
 	// committed, anchored to that committed block's hash, read here from the
 	// node's own block store.
 	if len(relays) > 0 {
-		startVerdictPublish(app, n, home, i, relays)
+		startVerdictPublish(app, n, home, i, relays, *commitMax)
 	}
 
 	mux := http.NewServeMux()
@@ -611,7 +612,7 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 // the ABCI app itself cannot see.  A misconfiguration is logged and disables
 // publishing -- it never takes the validator down, because publishing is a
 // notification path, not the chain.
-func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []string) {
+func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []string, commitMax time.Duration) {
 	vk, err := loadVerdictKey(filepath.Join(home, "config", "verdict_key.json"))
 	if err != nil {
 		log.Printf("%s: verdict publish off: %v", names[i], err)
@@ -625,7 +626,7 @@ func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []st
 		return
 	}
 	pub, err := NewPublisher(PublisherConfig{
-		Key: vk, Relay: writer, App: app,
+		Key: vk, Relay: writer, App: app, MaxInterval: commitMax,
 		BlockHash: func(height int64) (string, bool) {
 			meta := n.BlockStore().LoadBlockMeta(height)
 			if meta == nil {

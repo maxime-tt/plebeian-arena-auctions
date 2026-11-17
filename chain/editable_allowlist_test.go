@@ -41,27 +41,48 @@ func resignWithTags(t *testing.T, sk *btcec.PrivateKey, ev *Event, tags [][]stri
 // ---- the kind map (spec §7) ----------------------------------------------
 
 // TestKindMapIsRegularRange asserts the whole 1440 series sits in NIP-01's
-// regular range (1000 <= n < 10000), never the ephemeral range khatru drops.
+// regular range (1000 <= n < 10000), never the ephemeral range khatru drops —
+// with ONE explicit, documented exception, the state pulse (kind 21447), which
+// is a heartbeat and is ephemeral BY DESIGN (owner ruling, handover §8.1).
 func TestKindMapIsRegularRange(t *testing.T) {
 	if len(AuctionKinds) == 0 {
 		t.Fatal("AuctionKinds must not be empty")
 	}
 	want := map[string]int{
 		"create": KindCreate, "bid": KindBid, "chat": KindChat, "refund": KindRefund,
-		"settle": KindSettle, "outcome": KindOutcome, "funding_abort": KindFundingAbort, "state_commit": KindStateCommit,
+		"settle": KindSettle, "outcome": KindOutcome, "funding_abort": KindFundingAbort,
+		"state_commit": KindStateCommit, "params": KindParams,
 	}
 	for role, k := range want {
 		if AuctionKinds[role] != k {
 			t.Errorf("AuctionKinds[%q] = %d, want %d", role, AuctionKinds[role], k)
 		}
 	}
+	// The pulse is the ONE deliberate exception to the regular range, and it is
+	// named here rather than skipped in a blanket loop.  A pulse is a heartbeat
+	// whose loss costs nothing, so it is ephemeral (NIP-01 20000..29999); the
+	// STORED anchor stays KindStateCommit (1447), which proves a chain of time.
+	// The series' rationale ("an ephemeral kind would silently drop auction
+	// traffic") is about auction traffic, not about a heartbeat.
+	if AuctionKinds["state_pulse"] != KindStatePulse {
+		t.Errorf("AuctionKinds[\"state_pulse\"] = %d, want %d", AuctionKinds["state_pulse"], KindStatePulse)
+	}
+	if !ephemeralKind(KindStatePulse) {
+		t.Errorf("the state pulse must be ephemeral (NIP-01 20000..29999), got kind %d", KindStatePulse)
+	}
+	if regularKind(KindStatePulse) {
+		t.Errorf("the state pulse must NOT be a regular kind, got %d", KindStatePulse)
+	}
 	for role, k := range AuctionKinds {
+		if role == "state_pulse" {
+			continue // the documented exception above
+		}
 		if !regularKind(k) {
 			t.Errorf("kind %q = %d is outside the regular range 1000..9999", role, k)
 		}
 	}
 	// the series must line up with the spec's exact numbering
-	for role, k := range map[string]int{"create": 1440, "bid": 1441, "chat": 1442, "refund": 1443, "settle": 1444, "outcome": 1445, "funding_abort": 1446, "state_commit": 1447} {
+	for role, k := range map[string]int{"create": 1440, "bid": 1441, "chat": 1442, "refund": 1443, "settle": 1444, "outcome": 1445, "funding_abort": 1446, "state_commit": 1447, "params": 1448} {
 		if AuctionKinds[role] != k {
 			t.Errorf("role %q must be %d, got %d", role, k, AuctionKinds[role])
 		}
@@ -76,8 +97,13 @@ func TestKindMapIsRegularRange(t *testing.T) {
 func TestNoScatteredKindLiterals(t *testing.T) {
 	old := regexp.MustCompile(`\b28(6[3-9]\d|6[5-9]\d)\b`) // the POC's 2864x ephemeral range
 	// a bare 144x used AS A NUMBER (not preceded by a quote, not part of a
-	// coordinate string like "1440:" and not in a kind: json field)
-	bare := regexp.MustCompile(`(^|[^\w"'])(144[0-7])([^\w":]|$)`)
+	// coordinate string like "1440:" and not in a kind: json field).  The class
+	// is 144[0-9], so the params kind (1448) is covered alongside the rest.
+	bare := regexp.MustCompile(`(^|[^\w"'])(144[0-9])([^\w":]|$)`)
+	// the ephemeral pulse is a five-digit number the 144x class cannot see, so
+	// it gets its own literal check (same exemptions: quotes, coordinates,
+	// comments and any line that already names a Kind constant).
+	pulse := regexp.MustCompile(`(^|[^\w"'])(21447)([^\w":]|$)`)
 	root := "."
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -105,6 +131,9 @@ func TestNoScatteredKindLiterals(t *testing.T) {
 				t.Errorf("%s:%d: removed POC kind literal: %s", path, i+1, strings.TrimSpace(line))
 			}
 			if bare.MatchString(code) && !strings.Contains(code, "Kind") {
+				t.Errorf("%s:%d: scattered kind literal: %s", path, i+1, strings.TrimSpace(line))
+			}
+			if pulse.MatchString(code) && !strings.Contains(code, "Kind") {
 				t.Errorf("%s:%d: scattered kind literal: %s", path, i+1, strings.TrimSpace(line))
 			}
 		}

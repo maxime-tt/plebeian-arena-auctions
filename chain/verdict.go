@@ -34,6 +34,11 @@ package main
 // (`nak serve`) refuses an ephemeral EVENT with no matching live subscription
 // ("mute: no one was listening for this") and does not buffer it.  A verdict
 // that only exists while somebody happens to be subscribed is not a verdict.
+//
+// THE STATE PULSE (kind 21447) IS THE ONE EXCEPTION, and it is deliberate: it
+// is a heartbeat, not a verdict, so its loss costs nothing and it is ephemeral
+// by design (owner ruling, handover §8.1).  It never carries a verdict or a bid
+// confirmation; the stored anchor stays the 1447 commitment.
 
 import (
 	"crypto/sha256"
@@ -44,6 +49,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -54,10 +60,26 @@ const (
 	VerdictSchema = "arena.verdict.v1"
 	// StateCommitSchema is the content schema of a kind-1447 state commitment.
 	StateCommitSchema = "arena.statecommit.v1"
+	// StatePulseSchema is the content schema of a kind-21447 state pulse.
+	StatePulseSchema = "arena.statepulse.v1"
+	// ParamsSchema is the content schema of a kind-1448 params event.
+	ParamsSchema = "arena.params.v1"
 	// DerivedFromCommittedState states the determinism claim ON THE WIRE: the
 	// outcome is a pure function of committed state, not a validator opinion.
 	DerivedFromCommittedState = "committed_state"
-	// StateCommitEvery is the default cadence, in blocks, of a state commitment.
+	// StateCommitMaxInterval is the default maximum WALL-CLOCK gap between two
+	// stored state commitments.  It is the heartbeat bound: blocks are produced
+	// on demand, so a block-height cadence has no wall-time bound at all and an
+	// idle chain could leave its committed clock stale indefinitely (handover
+	// §1).  The publisher (verdictpublish.go) also commits whenever the height
+	// moves, which is the more frequent case.
+	StateCommitMaxInterval = 10 * time.Second
+	// StateCommitEvery is the default cadence, in blocks, for re-publishing the
+	// PARAMS event (kind 1448) so a long-lived chain without a terms change
+	// still refreshes it.  It is NO LONGER the state-commitment gate: the
+	// commitment is gated on a verdict, the first pass, a height move or the
+	// StateCommitMaxInterval heartbeat (handover §1.4).  Publisher.every is
+	// kept only for this params cadence.
 	StateCommitEvery int64 = 100
 )
 
@@ -82,6 +104,16 @@ var (
 	ErrCommitmentBadSchema    = errors.New("bad_state_commitment_schema")
 	ErrCommitmentBadSignature = errors.New("bad_state_commitment_signature")
 	ErrCommitmentUnanchored   = errors.New("unanchored_state_commitment")
+	ErrPulseKind              = errors.New("not_a_state_pulse")
+	ErrPulseBadSchema         = errors.New("bad_state_pulse_schema")
+	ErrPulseBadSignature      = errors.New("bad_state_pulse_signature")
+	ErrPulseUnanchored        = errors.New("unanchored_state_pulse")
+	ErrPulseNotInRoster       = errors.New("state_pulse_not_in_roster")
+	ErrParamsKind             = errors.New("not_a_params_event")
+	ErrParamsBadSchema        = errors.New("bad_params_schema")
+	ErrParamsBadSignature     = errors.New("bad_params_signature")
+	ErrParamsUnanchored       = errors.New("unanchored_params_event")
+	ErrParamsNotInRoster      = errors.New("params_not_in_roster")
 )
 
 // ValidatorKey is one roster entry: a validator's Nostr pubkey, its moniker and
@@ -162,6 +194,65 @@ type StateCommitmentContent struct {
 	Height  int64  `json:"height"`
 	AppHash string `json:"app_hash"`
 	Time    int64  `json:"time"`
+}
+
+// StatePulseContent is the exact content JSON of a kind-21447 state pulse.  The
+// anchor (height + app hash) is mandatory, exactly as on the commitment it
+// twins; only the kind and the schema differ.  Time is the wall clock at which
+// the pulse was signed and is what advances between two pulses at ONE height.
+type StatePulseContent struct {
+	Schema  string `json:"schema"`
+	Height  int64  `json:"height"`
+	AppHash string `json:"app_hash"`
+	Time    int64  `json:"time"`
+}
+
+// ParamsContent is the exact content JSON of a kind-1448 params event: the
+// escrow's TERMS, not a hash of them.  The market app reads every term from the
+// relay alone (handover §4), so this event is the relay source for the FROST
+// escrow key, the mint and keyset, the window and duration bounds, the proof
+// cap, the threshold and the validator roster.  The anchor (height, app_hash)
+// is the SAME one the commitment published in the same pass carries, so a
+// client that reads params + height can tell they belong together: the terms
+// here are the terms committed in THAT app hash (handover §4 consistency rule).
+type ParamsContent struct {
+	Schema        string            `json:"schema"`
+	Height        int64             `json:"height"`
+	AppHash       string            `json:"app_hash"`
+	ParamsVersion string            `json:"params_version"`
+	GroupKey      string            `json:"group_key"`
+	MintURL       string            `json:"mint_url"`
+	KeysetID      string            `json:"keyset_id"`
+	Keys          map[string]string `json:"keys"`
+	// SettlementSafetySec is how long after the end a bid itself establishes
+	// the settlement must land; BidToConsensusLatencySec covers the bidder's
+	// clock to the admitting block (spec §2.1).
+	SettlementSafetySec      int64          `json:"settlement_safety_sec"`
+	BidToConsensusLatencySec int64          `json:"bid_to_consensus_latency_sec"`
+	MinWindowSec             int64          `json:"min_window_sec"`
+	MaxWindowSec             int64          `json:"max_window_sec"`
+	MinDurationSec           int64          `json:"min_duration_sec"`
+	MaxDurationSec           int64          `json:"max_duration_sec"`
+	MaxProofs                int            `json:"max_proofs"`
+	Threshold                int            `json:"threshold"`
+	Validators               []ValidatorKey `json:"validators"`
+}
+
+// paramsVersion is the CONTENT DIGEST of a Params value: the sha256 hex of its
+// canonical JSON.  It is NOT a counter -- there is no version number to bump,
+// because the terms are simply whatever the committed state says they are at
+// the height the event names.  A client compares the params it TRUSTS against
+// the commitment it trusts by this value: the same digest means the terms it
+// holds are the terms in that app hash, and a differing digest means they are
+// stale.  json.Marshal is deterministic here (map keys sorted, struct fields in
+// declaration order), so every validator computes the same digest for the same
+// Params -- which is the whole point of putting it on the wire.
+func paramsVersion(p Params) string {
+	// Params cannot fail to marshal for committed state: it is strings, ints,
+	// string maps and a json.RawMessage that already came from JSON.
+	b, _ := json.Marshal(p)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // NostrPubkeyHex is the x-only Nostr pubkey (64 lowercase hex) for a secp256k1
@@ -341,6 +432,124 @@ func ParseStateCommitment(ev *Event, roster map[string]ValidatorKey) (*StateComm
 	if roster != nil {
 		if _, ok := roster[ev.Pubkey]; !ok {
 			return nil, fmt.Errorf("%w: %s", ErrVerdictNotInRoster, ev.Pubkey)
+		}
+	}
+	return &c, nil
+}
+
+// BuildStatePulseEvent builds a signed kind-21447 state pulse.  The anchor
+// (height + app hash) is mandatory, exactly as on a state commitment, and the
+// tags are the same height/hash/p triple; only the kind and the schema differ.
+// The event is EPHEMERAL: the relay forwards it to live subscribers and stores
+// nothing, so a pulse dropped for having no listener is a non-event.
+func BuildStatePulseEvent(sk *btcec.PrivateKey, height int64, appHashHex string, at int64) (*Event, error) {
+	if height <= 0 || appHashHex == "" {
+		return nil, ErrPulseUnanchored
+	}
+	c := StatePulseContent{Schema: StatePulseSchema, Height: height, AppHash: appHashHex, Time: at}
+	body, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	tags := [][]string{
+		{"height", strconv.FormatInt(height, 10)},
+		{"hash", appHashHex},
+		{"p", NostrPubkeyHex(sk)},
+	}
+	return SignEvent(sk, KindStatePulse, string(body), tags, at)
+}
+
+// ParseStatePulse reads a kind-21447 event, verifying signature, schema and the
+// mandatory anchor -- the same gate as ParseStateCommitment.
+func ParseStatePulse(ev *Event, roster map[string]ValidatorKey) (*StatePulseContent, error) {
+	if ev == nil || ev.Kind != KindStatePulse {
+		return nil, ErrPulseKind
+	}
+	if err := ev.Verify(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPulseBadSignature, err)
+	}
+	var c StatePulseContent
+	if err := json.Unmarshal([]byte(ev.Content), &c); err != nil {
+		return nil, ErrPulseBadSchema
+	}
+	if c.Schema != StatePulseSchema {
+		return nil, fmt.Errorf("%w: %q", ErrPulseBadSchema, c.Schema)
+	}
+	tagHeight, okH := tagValue(ev.Tags, "height")
+	tagHash, okHash := tagValue(ev.Tags, "hash")
+	if !okH || !okHash || tagHeight == "" || tagHash == "" || c.Height <= 0 || c.AppHash == "" {
+		return nil, ErrPulseUnanchored
+	}
+	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.AppHash {
+		return nil, ErrPulseUnanchored
+	}
+	if roster != nil {
+		if _, ok := roster[ev.Pubkey]; !ok {
+			return nil, fmt.Errorf("%w: %s", ErrPulseNotInRoster, ev.Pubkey)
+		}
+	}
+	return &c, nil
+}
+
+// BuildParamsEvent builds a signed kind-1448 params event carrying the escrow's
+// terms.  The anchor (height + app hash) is mandatory, exactly as on a state
+// commitment, and it must be the same height and app hash as the commitment
+// published in the same pass, so a client can tell the terms and the commitment
+// belong together (handover §4).  The event is a STORED (regular) kind: a client
+// that was offline still finds the current terms.
+func BuildParamsEvent(sk *btcec.PrivateKey, p Params, height int64, appHashHex string, at int64) (*Event, error) {
+	if height <= 0 || appHashHex == "" {
+		return nil, ErrParamsUnanchored
+	}
+	c := ParamsContent{
+		Schema: ParamsSchema, Height: height, AppHash: appHashHex, ParamsVersion: paramsVersion(p),
+		GroupKey: p.GroupKey, MintURL: p.MintURL, KeysetID: p.KeysetID, Keys: p.Keys,
+		SettlementSafetySec: p.SettlementSafetySec, BidToConsensusLatencySec: p.BidToConsensusLatencySec,
+		MinWindowSec: p.MinWindowSec, MaxWindowSec: p.MaxWindowSec,
+		MinDurationSec: p.MinDurationSec, MaxDurationSec: p.MaxDurationSec,
+		MaxProofs: p.MaxProofs, Threshold: p.Threshold, Validators: p.Validators,
+	}
+	body, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	tags := [][]string{
+		{"height", strconv.FormatInt(height, 10)},
+		{"hash", appHashHex},
+		{"p", NostrPubkeyHex(sk)},
+	}
+	return SignEvent(sk, KindParams, string(body), tags, at)
+}
+
+// ParseParamsEvent reads a kind-1448 event as a client would: it verifies the
+// signature and the schema, and cross-checks the tag anchor against the content
+// anchor, refusing by name when they disagree -- so a relay that re-framed one
+// cannot hide the other.  roster, when non-nil, additionally checks membership.
+func ParseParamsEvent(ev *Event, roster map[string]ValidatorKey) (*ParamsContent, error) {
+	if ev == nil || ev.Kind != KindParams {
+		return nil, ErrParamsKind
+	}
+	if err := ev.Verify(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrParamsBadSignature, err)
+	}
+	var c ParamsContent
+	if err := json.Unmarshal([]byte(ev.Content), &c); err != nil {
+		return nil, ErrParamsBadSchema
+	}
+	if c.Schema != ParamsSchema {
+		return nil, fmt.Errorf("%w: %q", ErrParamsBadSchema, c.Schema)
+	}
+	tagHeight, okH := tagValue(ev.Tags, "height")
+	tagHash, okHash := tagValue(ev.Tags, "hash")
+	if !okH || !okHash || tagHeight == "" || tagHash == "" || c.Height <= 0 || c.AppHash == "" {
+		return nil, ErrParamsUnanchored
+	}
+	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.AppHash {
+		return nil, ErrParamsUnanchored
+	}
+	if roster != nil {
+		if _, ok := roster[ev.Pubkey]; !ok {
+			return nil, fmt.Errorf("%w: %s", ErrParamsNotInRoster, ev.Pubkey)
 		}
 	}
 	return &c, nil
