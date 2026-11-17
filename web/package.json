@@ -4,7 +4,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "node test/page-cost.mjs && node test/login.mjs && node test/worker-ready.mjs",
+    "test": "node test/page-cost.mjs && node test/login.mjs && node test/worker-ready.mjs && node test/bid-locktime.mjs",
     "build": "vite build"
   },
   "keywords": [],

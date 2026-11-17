@@ -78,6 +78,24 @@ const blank = (amount, params) => {
   return { outs, outputs: outs.map((o) => ({ amount: num(o.blindedMessage.amount), id: o.blindedMessage.id, B_: o.blindedMessage.B_ })) };
 };
 
+// The minimum locktime for a bid at time `now` (spec §2.1). `now` is the
+// bidder's clock, but the chain derives its floor from the BLOCK time of the
+// block that admits the bid, and bid_to_consensus_latency is the allowance for
+// the gap between the two. The block is produced after we sign, so we estimate
+// it as now + latency (the latest gap the chain tolerates): the lock then
+// clears the end the chain will establish for any admitting block within that
+// allowance. A fixed lot carries no block-time term at all -- its floor is
+// end_at + safety + latency -- so its locktime is unchanged. Over-locking is
+// allowed (spec §2.3, no maximum lock time).
+export function minBidLocktime(auction, params, now) {
+  const safety = num(params.settlementSafetySec ?? 900);
+  const latency = num(params.bidToConsensusLatencySec ?? 15);
+  const window = auction.mode === 'antisnipe' ? num(auction.windowSec) : 0;
+  const block = now + (window > 0 ? latency : 0);
+  const end = auction.mode === 'antisnipe' ? Math.max(num(auction.endAt), block + window) : num(auction.endAt);
+  return Math.ceil(Math.max(end, block + window) + safety + latency);
+}
+
 export class ArenaClient {
   constructor(base = '') {
     this.base = base;
@@ -255,11 +273,13 @@ export class ArenaClient {
   // locktime. cashu-ts emits exactly the canonical five-tag secret for these
   // options (locktime, pubkeys, n_sigs, refund, sigflag), which is what the
   // chain's strict parser and the mint both require (spec §1.1).
-  // Locktime (spec §2.1): minLock = max(end, now + window) + settlement_safety
+  // Locktime (spec §2.1): minLock = max(end, block + window) + settlement_safety
   // + bid_to_consensus_latency, where `end` is the end THIS bid establishes --
   // an anti-snipe bid with less than the window left resets the clock to the
-  // window, so the lock must clear now + window + safety + latency, not the old
-  // end.
+  // window, so the lock must clear block + window + safety + latency, not the
+  // old end -- and `block` is the time of the block that will admit the bid
+  // (the chain measures against the block, not the bidder's clock). Derived by
+  // minBidLocktime above.
   async lockForBid(id, amount, params, auction, { force = false, state, now = Date.now() / 1000 } = {}) {
     if (!force) {
       const min = auction.highBid ? auction.highAmount + auction.minIncrement : auction.startPrice;
@@ -272,13 +292,7 @@ export class ArenaClient {
   }
   async lockOnce(id, amount, params, auction, now) {
     const m = await this.coco(id);
-    const safety = num(params.settlementSafetySec ?? 900);
-    const latency = num(params.bidToConsensusLatencySec ?? 15);
-    // the end this bid establishes: an anti-snipe bid inside the window resets
-    // the clock to the window (chain §3), so the lock must clear now+window.
-    const window = auction.mode === 'antisnipe' ? num(auction.windowSec) : 0;
-    const end = auction.mode === 'antisnipe' ? Math.max(auction.endAt, now + window) : auction.endAt;
-    const locktime = Math.ceil(Math.max(end, now + window) + safety + latency);
+    const locktime = minBidLocktime(auction, params, now);
     const prep = await m.ops.send.prepare({
       mintUrl: this.mintUrl, amount,
       target: { type: 'p2pk', options: {
