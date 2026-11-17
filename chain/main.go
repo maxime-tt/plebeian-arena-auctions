@@ -159,7 +159,7 @@ func cmdGateway(args []string) {
 	addr := fs.String("addr", "127.0.0.1:8080", "listen addr")
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint")
 	demo := fs.Bool("demo-controls", false, "expose the unauthenticated validator stop/start route (demo only, never on a real-sats deployment)")
-	commitMaxInterval := fs.Duration("commit-max-interval", 10*time.Second, "maximum wall-clock gap between state commitments")
+	commitMaxInterval := fs.Duration("commit-max-interval", StateCommitMaxInterval, "maximum wall-clock gap between state commitments")
 	var relays relayURLs
 	fs.Var(&relays, "relay", "relay websocket URL clients publish to (repeatable); the relay is the primary transport")
 	fs.Parse(args)
