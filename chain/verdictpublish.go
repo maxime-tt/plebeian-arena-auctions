@@ -112,6 +112,7 @@ type Publisher struct {
 	lastCommitHeight int64           // committed height of the last commitment published
 	lastCommitTime   int64           // unix seconds (p.now) of the last commitment published
 	lastParams       string          // params digest of the last params event published
+	lastParamsHeight int64           // committed height of the last params event published
 	records          []PublishRecord
 }
 
@@ -203,9 +204,14 @@ func (p *Publisher) Step(ctx context.Context) {
 
 	// 3. Params: publish when the terms CHANGE, and on the block cadence so a
 	//    long-lived chain refreshes them even without a change (handover §4).
+	//    The cadence is EDGE-triggered on the height: blocks are produced on
+	//    demand, so a chain can sit at one height for a long time, and a bare
+	//    `height % every == 0` would re-publish the same event on every pass
+	//    while it does (measured live: 61 events per validator at one height).
 	digest := paramsVersion(state.Params)
 	p.mu.Lock()
-	needParams := p.lastParams == "" || digest != p.lastParams || height%p.every == 0
+	needParams := p.lastParams == "" || digest != p.lastParams ||
+		(height%p.every == 0 && height != p.lastParamsHeight)
 	// 4. Stored commitment gate: a verdict went out, the first ever publish, the
 	//    committed height moved, the heartbeat elapsed, or params need an anchor
 	//    to ride.  The heartbeat is the point of the change: blocks are produced
@@ -252,6 +258,7 @@ func (p *Publisher) Step(ctx context.Context) {
 		} else {
 			p.mu.Lock()
 			p.lastParams = digest
+			p.lastParamsHeight = height
 			p.mu.Unlock()
 		}
 		p.record(rec)

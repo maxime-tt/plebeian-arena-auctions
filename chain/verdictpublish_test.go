@@ -466,3 +466,39 @@ func TestParamsEventAnchorsToTheSameHeightAsTheCommitment(t *testing.T) {
 		t.Fatalf("params anchor height = %d, want the committed height 11", pc.Height)
 	}
 }
+
+// TestParamsCadenceDoesNotRepublishWhileIdleAtAMultipleOfEvery: blocks are
+// produced on demand, so a chain can sit at one height indefinitely. The params
+// cadence is `every` blocks and must fire ONCE when the committed height reaches
+// a multiple of `every` -- not on every pass while it stays there. Measured live
+// before this was fixed: 61 events per validator at a single height.
+func TestParamsCadenceDoesNotRepublishWhileIdleAtAMultipleOfEvery(t *testing.T) {
+	a, _, _ := liveApp(t)
+	finalize(t, a, 100, tNow+1)
+	rec := &recordingRelay{}
+	now := tNow + 2
+	// Cadence 100 blocks with a one-hour heartbeat: only the cadence can fire.
+	pub := newTestPublisher(t, a, rec, StateCommitEvery, time.Hour, func() int64 { return now })
+	ctx := context.Background()
+
+	pub.Step(ctx) // first pass
+	if got := countRecords(pub, "params"); got != 1 {
+		t.Fatalf("the first pass must publish the params once, got %d: %v", got, pub.Records())
+	}
+	// The chain stays at height 100 -- a multiple of the cadence -- for a while.
+	for i := 0; i < 5; i++ {
+		now++
+		pub.Step(ctx)
+	}
+	if got := countRecords(pub, "params"); got != 1 {
+		t.Fatalf("idle at a multiple of the cadence must publish once, got %d: %v", got, pub.Records())
+	}
+
+	// Moving on to the NEXT multiple of the cadence republishes.
+	finalize(t, a, 200, tNow+2)
+	now++
+	pub.Step(ctx)
+	if got := countRecords(pub, "params"); got != 2 {
+		t.Fatalf("the next cadence height must republish, got %d: %v", got, pub.Records())
+	}
+}
