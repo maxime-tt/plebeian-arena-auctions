@@ -16,6 +16,7 @@ report — what was built, what was proven, and what is still open.
 | Push | `* [new branch] feat/validator-workstreams` (`ab79d4d`), then `ab79d4d..328ce53 feat/validator-workstreams -> feat/validator-workstreams` |
 | Diff vs base | 19 files, +3041 / −182 |
 | Commits | `1ef429c` (A+D) · `3f51340`, `c97130b`, `ac0c6a6`, `d39fdc8` (B+C) · `1870243` (client lock margin) · merges `144efd2`, `d7b8c1b` · `47780b4`, `ab79d4d`, `328ce53` |
+| This report | added by `5c903d3`; the code state it describes is `328ce53` |
 
 Lane branches `feat/validator-ingest` (`d39fdc8`) and `feat/bid-locktime-margin` (`1870243`) are
 merged into the branch above; the worktrees `~/work/wt-validator`, `~/work/wt-ingest`,
