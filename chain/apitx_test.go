@@ -187,6 +187,24 @@ func TestApiTxLateBidKeepsLateField(t *testing.T) {
 	}
 }
 
+// TestApiTxAppRejectionIsTerminal: when the only validator answer is the
+// application-rejection error object, /api/tx must say 400 (an answer), not 503
+// (retryable), so a client does not retry a tx the chain will never accept.
+func TestApiTxAppRejectionIsTerminal(t *testing.T) {
+	rejecting, _ := fakeRPCServer(t, errorObjectBody(t, appRejectedBroadcast))
+	event, tx := apiTxFixture(t, "ApiTx app rejection")
+
+	status, out := submitTx(context.Background(), http.DefaultClient,
+		[]validatorRPC{{Name: "Validator 1", URL: rejecting.URL}}, event, tx, nil)
+
+	if status != http.StatusBadRequest || out["ok"] == true {
+		t.Fatalf("status=%d out=%v, want 400 not-ok (terminal, not retryable)", status, out)
+	}
+	if message, _ := out["error"].(string); !strings.Contains(message, "is invalid: code=2") {
+		t.Fatalf("error = %v, want the application's rejection message", out["error"])
+	}
+}
+
 // TestApiTxHashIsCometBFTTxHash pins the local hash to CometBFT's own:
 // types.Tx.Hash() is sha256 over the raw tx bytes, and the RPC reports it as
 // uppercase hex.  A client polling by this hash must match what the node saw.

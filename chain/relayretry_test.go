@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"path/filepath"
@@ -73,6 +75,27 @@ func (cursor *fakeCursor) advanced() []string {
 
 func quietLogger() *log.Logger { return log.New(io.Discard, "", 0) }
 
+// appRejectedBroadcast is the real shape CometBFT returns in the broadcast error
+// object when the application rejects a tx: mempool.ErrInvalidTx ("tx %X is
+// invalid: code=%d, …") wrapped by rpc/core/mempool.go ("broadcast error on
+// transaction validation: %w").  A non-zero code is the application's answer.
+const appRejectedBroadcast = "broadcast error on transaction validation: tx 3ED1042E is invalid: code=2, data=, log='locktime below the floor for this lot: 1794925677 is under 1794932192', codespace=''"
+
+// catchingUpBroadcast is the readiness refusal from handover §2: it carries no
+// application code and must stay transient.
+const catchingUpBroadcast = "endpoint is closed while node is catching up"
+
+// errorObjectBody renders an httptest broadcast response carrying message in the
+// RPC error object's data field.
+func errorObjectBody(t *testing.T, message string) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"error": map[string]any{"data": message}})
+	if err != nil {
+		t.Fatalf("marshal error body: %v", err)
+	}
+	return string(body)
+}
+
 // TestObserverRetriesTransientSubmitFailure: a transient refusal must not lose
 // the event.  The first submit fails, the worker retries with backoff, and once
 // the node is ready the event commits -- and only then does the cursor advance,
@@ -128,7 +151,13 @@ func TestObserverDropsTerminalRejection(t *testing.T) {
 	event := signedCreate(t, secret, "Terminal drop", 1_800_000_200)
 
 	submitter := NewMemorySubmitter()
-	submitter.FailAlways(event.ID, &SubmitFailure{Message: "CheckTx rejected: unsupported kind 9999"})
+	// The real shape, as the RPC layer now builds it: appRejectionCode reads a
+	// non-zero code out of the broadcast message, so the failure reaches the
+	// observer as terminal and must never be retried.
+	if appRejectionCode(appRejectedBroadcast) == 0 {
+		t.Fatal("appRejectionCode must read the application code out of the broadcast message")
+	}
+	submitter.FailAlways(event.ID, &SubmitFailure{Message: "broadcast rejected: " + appRejectedBroadcast})
 
 	cursor := newFakeCursor()
 	observer, err := NewObserver(ObserverConfig{URL: "ws://drop.example", Submitter: submitter, Cursor: cursor, Logger: quietLogger()})
@@ -218,6 +247,70 @@ func TestCursorHoldsBehindAnUnsettledEvent(t *testing.T) {
 		last := cursor.last()
 		return last.CreatedAt == newer.CreatedAt && last.EventID == newer.ID
 	}, "the cursor to catch up to the newer event")
+}
+
+// TestAppRejectionCode: the split is read off the message, so a CheckTx code is
+// an answer and anything else is not.
+func TestAppRejectionCode(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+		want    uint32
+	}{
+		{"app rejection", appRejectedBroadcast, 2},
+		{"readiness refusal", catchingUpBroadcast, 0},
+		{"zero code is not an answer", "broadcast error on transaction validation: tx AB is invalid: code=0, data=, log='', codespace=''", 0},
+		{"no marker", "broadcast returned no result", 0},
+		{"marker without digits", "tx AB is invalid: code=x, data=, log='', codespace=''", 0},
+	}
+	for _, testCase := range cases {
+		if got := appRejectionCode(testCase.message); got != testCase.want {
+			t.Fatalf("%s: appRejectionCode(%q) = %d, want %d", testCase.name, testCase.message, got, testCase.want)
+		}
+	}
+}
+
+// TestRPCSubmitterAppRejectionIsTerminal: an application rejection arriving in
+// the RPC error object is an answer, not a readiness problem.  Classifying it
+// transient retried it forever at the 5 s cap and starved the FIFO queue behind
+// it (the acceptance suite's "timeout waiting for bid commit").
+func TestRPCSubmitterAppRejectionIsTerminal(t *testing.T) {
+	rejecting, _ := fakeRPCServer(t, errorObjectBody(t, appRejectedBroadcast))
+	nostrEvent := signedCreate(t, nostr.GeneratePrivateKey(), "App rejection", 1_800_000_600)
+
+	_, err := RPCSubmitter{URLs: []string{rejecting.URL}}.SubmitEvent(context.Background(), toChainEvent(&nostrEvent))
+	if err == nil {
+		t.Fatal("an application rejection must be an error, got nil")
+	}
+	if IsTransientSubmit(err) {
+		t.Fatalf("app rejection classified transient (it would be retried forever): %v", err)
+	}
+	var failure *SubmitFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("err = %v (%T), want a *SubmitFailure", err, err)
+	}
+	if failure.Transient {
+		t.Fatalf("SubmitFailure.Transient = true, want false")
+	}
+	if !strings.Contains(failure.Message, "is invalid: code=2") {
+		t.Fatalf("message %q lost the application code", failure.Message)
+	}
+}
+
+// TestRPCSubmitterCatchingUpIsTransient: the readiness refusal from handover §2
+// must stay transient, or a node that is still catching up would lose the event
+// waiting on the relay.
+func TestRPCSubmitterCatchingUpIsTransient(t *testing.T) {
+	catchingUp, _ := fakeRPCServer(t, errorObjectBody(t, catchingUpBroadcast))
+	nostrEvent := signedCreate(t, nostr.GeneratePrivateKey(), "Catching up", 1_800_000_700)
+
+	_, err := RPCSubmitter{URLs: []string{catchingUp.URL}}.SubmitEvent(context.Background(), toChainEvent(&nostrEvent))
+	if err == nil {
+		t.Fatal("a readiness refusal must be an error, got nil")
+	}
+	if !IsTransientSubmit(err) {
+		t.Fatalf("catching-up refusal classified terminal: %v", err)
+	}
 }
 
 // TestRelayCursorPersistsAndResumes: the cursor is a JSON object keyed by relay

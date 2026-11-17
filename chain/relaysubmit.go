@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,6 +43,40 @@ type SubmitFailure struct {
 }
 
 func (failure *SubmitFailure) Error() string { return failure.Message }
+
+// appRejectionCode returns the application-level code carried in a CometBFT
+// broadcast error message, or 0 when the message carries none (a transport or
+// readiness refusal).
+//
+// CometBFT's mempool formats a CheckTx rejection as
+// "tx %X is invalid: code=%d, data=%X, log='%s', codespace='%s'"
+// (mempool/errors.go) and the RPC layer wraps it as
+// "broadcast error on transaction validation: %w" (rpc/core/mempool.go).  A
+// non-zero code is the application's ANSWER, and retrying it can never change
+// it, so it must be terminal.  This is why the split is read off the MESSAGE
+// and not off the RPC error object: that object carries both readiness problems
+// ("endpoint is closed while node is catching up") and answers, and only the
+// text tells them apart.
+func appRejectionCode(message string) uint32 {
+	const marker = "is invalid: code="
+	start := strings.Index(message, marker)
+	if start < 0 {
+		return 0
+	}
+	digits := message[start+len(marker):]
+	end := 0
+	for end < len(digits) && digits[end] >= '0' && digits[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	code, err := strconv.ParseUint(digits[:end], 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(code)
+}
 
 // IsTransientSubmit reports whether err carries a *SubmitFailure that says the
 // same submission may be attempted again.  It walks the whole wrap chain, so a
@@ -228,11 +264,16 @@ func (submitter RPCSubmitter) submitOne(ctx context.Context, endpoint string, tx
 		}
 		// A duplicate the node already has in its mempool is success, not a
 		// failure: it is the same transaction, and it will commit once.
-		if contains(message, "already exists in cache") {
+		if strings.Contains(message, "already exists in cache") {
 			return SubmitResult{}, nil
 		}
-		// CometBFT reports readiness problems (e.g. "endpoint is closed while
-		// node is catching up") through this object, so it is transient.
+		// The error object carries both the application's rejections and
+		// readiness problems, so read the split off the message: a CheckTx
+		// code is an answer (terminal), anything else (e.g. "endpoint is closed
+		// while node is catching up") is transient.
+		if appRejectionCode(message) != 0 {
+			return SubmitResult{}, &SubmitFailure{Message: fmt.Sprintf("broadcast rejected: %s", message)}
+		}
 		return SubmitResult{}, &SubmitFailure{Transient: true, Message: fmt.Sprintf("broadcast rejected: %s", message)}
 	}
 	if decoded.Result == nil {
@@ -243,18 +284,6 @@ func (submitter RPCSubmitter) submitOne(ctx context.Context, endpoint string, tx
 		return SubmitResult{}, &SubmitFailure{Message: fmt.Sprintf("CheckTx rejected: %s", decoded.Result.Log)}
 	}
 	return SubmitResult{Code: decoded.Result.Code, TxHash: decoded.Result.Hash}, nil
-}
-
-func contains(haystack, needle string) bool {
-	if needle == "" {
-		return false
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // MemorySubmitter records submissions in memory.  It exists so the observer loop

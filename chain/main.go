@@ -534,6 +534,12 @@ func broadcastTx(ctx context.Context, client *http.Client, rpcURL string, tx []b
 		if strings.Contains(msg, "already exists in cache") {
 			return broadcastOutcome{kind: broadcastAccepted, note: "already submitted"}
 		}
+		// Same split as RPCSubmitter: a CheckTx code in the message is the
+		// application's answer (terminal), anything else is a readiness or
+		// transport refusal the caller may retry.
+		if appRejectionCode(msg) != 0 {
+			return broadcastOutcome{kind: broadcastTerminal, message: msg}
+		}
 		return broadcastOutcome{kind: broadcastTransient, message: msg}
 	}
 	if rr.Result == nil {
