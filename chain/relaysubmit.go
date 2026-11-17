@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,6 +44,40 @@ type SubmitFailure struct {
 
 func (failure *SubmitFailure) Error() string { return failure.Message }
 
+// appRejectionCode returns the application-level code carried in a CometBFT
+// broadcast error message, or 0 when the message carries none (a transport or
+// readiness refusal).
+//
+// CometBFT's mempool formats a CheckTx rejection as
+// "tx %X is invalid: code=%d, data=%X, log='%s', codespace='%s'"
+// (mempool/errors.go) and the RPC layer wraps it as
+// "broadcast error on transaction validation: %w" (rpc/core/mempool.go).  A
+// non-zero code is the application's ANSWER, and retrying it can never change
+// it, so it must be terminal.  This is why the split is read off the MESSAGE
+// and not off the RPC error object: that object carries both readiness problems
+// ("endpoint is closed while node is catching up") and answers, and only the
+// text tells them apart.
+func appRejectionCode(message string) uint32 {
+	const marker = "is invalid: code="
+	start := strings.Index(message, marker)
+	if start < 0 {
+		return 0
+	}
+	digits := message[start+len(marker):]
+	end := 0
+	for end < len(digits) && digits[end] >= '0' && digits[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	code, err := strconv.ParseUint(digits[:end], 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(code)
+}
+
 // IsTransientSubmit reports whether err carries a *SubmitFailure that says the
 // same submission may be attempted again.  It walks the whole wrap chain, so a
 // caller may wrap the failure with context (as the observer does) without
@@ -49,6 +85,27 @@ func (failure *SubmitFailure) Error() string { return failure.Message }
 func IsTransientSubmit(err error) bool {
 	for err != nil {
 		if failure, ok := err.(*SubmitFailure); ok && failure.Transient {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+// IsAppRejection reports whether err carries a *SubmitFailure whose message is
+// the application's own rejection (a CheckTx code in the CometBFT broadcast
+// error).  Like IsTransientSubmit it walks the whole wrap chain.
+//
+// Such a refusal is deterministic for the committed state the node had when it
+// answered, but that state moves: a bid or supersession that arrives before its
+// create's block has committed is rejected with "unknown auction" or "update
+// must reference the auction root" and succeeds one block later.  So it is
+// worth retrying -- but only a bounded number of times, unlike a transport
+// refusal, which says nothing about the transaction and is retried without
+// limit.
+func IsAppRejection(err error) bool {
+	for err != nil {
+		if failure, ok := err.(*SubmitFailure); ok && appRejectionCode(failure.Message) != 0 {
 			return true
 		}
 		err = errors.Unwrap(err)
@@ -228,11 +285,16 @@ func (submitter RPCSubmitter) submitOne(ctx context.Context, endpoint string, tx
 		}
 		// A duplicate the node already has in its mempool is success, not a
 		// failure: it is the same transaction, and it will commit once.
-		if contains(message, "already exists in cache") {
+		if strings.Contains(message, "already exists in cache") {
 			return SubmitResult{}, nil
 		}
-		// CometBFT reports readiness problems (e.g. "endpoint is closed while
-		// node is catching up") through this object, so it is transient.
+		// The error object carries both the application's rejections and
+		// readiness problems, so read the split off the message: a CheckTx
+		// code is an answer (terminal), anything else (e.g. "endpoint is closed
+		// while node is catching up") is transient.
+		if appRejectionCode(message) != 0 {
+			return SubmitResult{}, &SubmitFailure{Message: fmt.Sprintf("broadcast rejected: %s", message)}
+		}
 		return SubmitResult{}, &SubmitFailure{Transient: true, Message: fmt.Sprintf("broadcast rejected: %s", message)}
 	}
 	if decoded.Result == nil {
@@ -245,18 +307,6 @@ func (submitter RPCSubmitter) submitOne(ctx context.Context, endpoint string, tx
 	return SubmitResult{Code: decoded.Result.Code, TxHash: decoded.Result.Hash}, nil
 }
 
-func contains(haystack, needle string) bool {
-	if needle == "" {
-		return false
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
-}
-
 // MemorySubmitter records submissions in memory.  It exists so the observer loop
 // and its reconnect behaviour can be tested without a chain, and so a validator
 // process that only wants to observe can be started without a broadcaster.
@@ -264,24 +314,34 @@ type MemorySubmitter struct {
 	mu          sync.Mutex
 	submissions []Event
 	failures    map[string]error
+	remaining   map[string]int
 	always      map[string]error
 	attempts    map[string]int
 }
 
 func NewMemorySubmitter() *MemorySubmitter {
 	return &MemorySubmitter{
-		failures: map[string]error{},
-		always:   map[string]error{},
-		attempts: map[string]int{},
+		failures:  map[string]error{},
+		remaining: map[string]int{},
+		always:    map[string]error{},
+		attempts:  map[string]int{},
 	}
 }
 
 // FailEvery makes the submitter return err for the named event, once.  A later
 // attempt at the same event succeeds, so it exercises "retry once and commit".
 func (submitter *MemorySubmitter) FailEvery(eventID string, err error) {
+	submitter.FailTimes(eventID, err, 1)
+}
+
+// FailTimes makes the submitter return err for the next n attempts at the named
+// event, then succeed.  It models a refusal the next block fixes (a bid that
+// arrived before its create's block committed).
+func (submitter *MemorySubmitter) FailTimes(eventID string, err error, times int) {
 	submitter.mu.Lock()
 	defer submitter.mu.Unlock()
 	submitter.failures[eventID] = err
+	submitter.remaining[eventID] = times
 }
 
 // FailAlways makes the submitter return err for the named event on every
@@ -298,6 +358,7 @@ func (submitter *MemorySubmitter) ClearFailures(eventID string) {
 	submitter.mu.Lock()
 	defer submitter.mu.Unlock()
 	delete(submitter.failures, eventID)
+	delete(submitter.remaining, eventID)
 	delete(submitter.always, eventID)
 }
 
@@ -316,9 +377,9 @@ func (submitter *MemorySubmitter) SubmitEvent(_ context.Context, event Event) (S
 	if err, ok := submitter.always[event.ID]; ok {
 		return SubmitResult{}, err
 	}
-	if err, ok := submitter.failures[event.ID]; ok {
-		delete(submitter.failures, event.ID)
-		return SubmitResult{}, err
+	if remaining := submitter.remaining[event.ID]; remaining > 0 {
+		submitter.remaining[event.ID] = remaining - 1
+		return SubmitResult{}, submitter.failures[event.ID]
 	}
 	submitter.submissions = append(submitter.submissions, event)
 	return SubmitResult{Height: int64(len(submitter.submissions)), TxHash: event.ID}, nil
