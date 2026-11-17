@@ -21,9 +21,9 @@ import (
 // fakeCursor is an in-memory CursorRecorder that records what the observer asked
 // it to remember, so a test can assert both the value and the timing.
 type fakeCursor struct {
-	mu       sync.Mutex
-	entries  map[string]cursorEntry
-	advances []string
+	mu      sync.Mutex
+	entries map[string]cursorEntry
+	calls   []cursorEntry
 }
 
 func newFakeCursor() *fakeCursor {
@@ -33,8 +33,9 @@ func newFakeCursor() *fakeCursor {
 func (cursor *fakeCursor) Advance(url string, createdAt int64, eventID string) error {
 	cursor.mu.Lock()
 	defer cursor.mu.Unlock()
-	cursor.entries[url] = cursorEntry{CreatedAt: createdAt, EventID: eventID}
-	cursor.advances = append(cursor.advances, eventID)
+	entry := cursorEntry{CreatedAt: createdAt, EventID: eventID}
+	cursor.entries[url] = entry
+	cursor.calls = append(cursor.calls, entry)
 	return nil
 }
 
@@ -48,10 +49,26 @@ func (cursor *fakeCursor) since(url string) (time.Time, string) {
 	return time.Unix(entry.CreatedAt, 0).UTC(), entry.EventID
 }
 
+// last is the position of the newest Advance call, or the zero value if there
+// was none.
+func (cursor *fakeCursor) last() cursorEntry {
+	cursor.mu.Lock()
+	defer cursor.mu.Unlock()
+	if len(cursor.calls) == 0 {
+		return cursorEntry{}
+	}
+	return cursor.calls[len(cursor.calls)-1]
+}
+
+// advanced returns the event ids Advance was called with, oldest first.
 func (cursor *fakeCursor) advanced() []string {
 	cursor.mu.Lock()
 	defer cursor.mu.Unlock()
-	return append([]string(nil), cursor.advances...)
+	ids := make([]string, 0, len(cursor.calls))
+	for _, call := range cursor.calls {
+		ids = append(ids, call.EventID)
+	}
+	return ids
 }
 
 func quietLogger() *log.Logger { return log.New(io.Discard, "", 0) }
@@ -144,6 +161,63 @@ func TestObserverDropsTerminalRejection(t *testing.T) {
 	if committed, _, _ := observer.Stats(); committed != 0 {
 		t.Fatalf("committed = %d, want 0 for a rejected event", committed)
 	}
+}
+
+// TestCursorHoldsBehindAnUnsettledEvent: the cursor means "everything at or
+// before this position is settled".  A newer event committing while an older one
+// is still queued must NOT move it, or a crash would resume past the older event
+// and lose it.
+func TestCursorHoldsBehindAnUnsettledEvent(t *testing.T) {
+	const url = "ws://hold.example"
+
+	olderEvent := signedCreate(t, nostr.GeneratePrivateKey(), "Cursor hold older", 1_800_000_090)
+	newerEvent := signedCreate(t, nostr.GeneratePrivateKey(), "Cursor hold newer", 1_800_000_101)
+	older, newer := toChainEvent(&olderEvent), toChainEvent(&newerEvent)
+
+	submitter := NewMemorySubmitter()
+	submitter.FailAlways(older.ID, &SubmitFailure{Transient: true, Message: "broadcast rejected: endpoint is closed while node is catching up"})
+
+	cursor := newFakeCursor()
+	// The cursor had reached the older event's position; it must not move on to
+	// the newer one while the older one is still unsettled.
+	if err := cursor.Advance(url, older.CreatedAt, older.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	observer, err := NewObserver(ObserverConfig{URL: url, Submitter: submitter, Cursor: cursor, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observer.RunRetriesForTest(ctx)
+
+	observer.HandleForTest(ctx, &olderEvent) // transient: queued for retry
+	observer.HandleForTest(ctx, &newerEvent) // commits
+
+	if committed, _, _ := observer.Stats(); committed != 1 {
+		t.Fatalf("committed = %d, want 1 (only the newer event)", committed)
+	}
+	// The newer event is settled, but the older one is not, so the persisted
+	// position must still be the OLDER event's -- never the newer one.
+	last := cursor.last()
+	if last.CreatedAt != older.CreatedAt || last.EventID != older.ID {
+		t.Fatalf("cursor = (%d, %s) after the newer event committed; want (%d, %s) while %s is still unsettled",
+			last.CreatedAt, last.EventID, older.CreatedAt, older.ID, older.ID)
+	}
+	if last.CreatedAt >= newer.CreatedAt {
+		t.Fatalf("cursor = %d skipped past the unsettled event at %d", last.CreatedAt, newer.CreatedAt)
+	}
+
+	// Once the older event is accepted too, the position catches up to the newer
+	// one in a single flush.
+	submitter.ClearFailures(older.ID)
+	waitFor(t, 5*time.Second, func() bool { return len(submitter.Submissions()) == 2 },
+		"the older event to commit after the node recovered")
+	waitFor(t, 5*time.Second, func() bool {
+		last := cursor.last()
+		return last.CreatedAt == newer.CreatedAt && last.EventID == newer.ID
+	}, "the cursor to catch up to the newer event")
 }
 
 // TestRelayCursorPersistsAndResumes: the cursor is a JSON object keyed by relay

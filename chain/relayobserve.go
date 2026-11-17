@@ -101,6 +101,14 @@ type Observer struct {
 	queue        *retryQueue
 	workerOnce   sync.Once
 	workerActive bool
+
+	// pending is how many events are queued or in flight (unsettled); while it
+	// is non-zero the durable cursor must not move, or a restart would resume
+	// past an event that never reached the chain.  settled is the highest
+	// position seen settled while pending was non-zero, flushed once it drains.
+	pending    int
+	settled    cursorEntry
+	settledSet bool
 }
 
 // NewObserver validates configuration and returns an observer ready to Run.
@@ -247,6 +255,11 @@ func (observer *Observer) retryWorker(ctx context.Context) {
 		observer.forget(observer.queue.drain())
 		observer.mu.Lock()
 		observer.workerActive = false
+		// Nothing is queued or in flight any more, and the drained events were
+		// forgotten so the next session's replay re-reads them: the cursor
+		// stays behind them rather than being flushed past them.
+		observer.pending = 0
+		observer.settledSet = false
 		observer.mu.Unlock()
 	}()
 	for {
@@ -267,12 +280,12 @@ func (observer *Observer) retryWorker(ctx context.Context) {
 			result, err := observer.config.Submitter.SubmitEvent(ctx, event)
 			if err == nil {
 				observer.queue.done(event.ID)
-				observer.committed(event, result)
+				observer.committed(event, result, true)
 				break
 			}
 			if !IsTransientSubmit(err) {
 				observer.queue.done(event.ID)
-				observer.droppedEvent(event, err)
+				observer.droppedEvent(event, err, true)
 				break
 			}
 			observer.recordError(fmt.Errorf("submit %s: %w", event.ID, err))
@@ -407,6 +420,9 @@ func (observer *Observer) handle(ctx context.Context, event *nostr.Event) {
 				// replay of it must not queue a second copy.  The retry worker
 				// owns it from here.
 				observer.config.Logger.Printf("relay observer: submit failed for %s (retrying): %v", event.ID, err)
+				// Mark it unsettled BEFORE queueing: a later event settling out
+				// of order must not advance the cursor past this one.
+				observer.markPending()
 				observer.queue.push(signed)
 				return
 			}
@@ -418,10 +434,10 @@ func (observer *Observer) handle(ctx context.Context, event *nostr.Event) {
 		}
 		// A terminal rejection is an answer: drop the event, record it, and let
 		// the cursor move past it so it is never re-read.
-		observer.droppedEvent(signed, err)
+		observer.droppedEvent(signed, err, false)
 		return
 	}
-	observer.committed(signed, result)
+	observer.committed(signed, result, false)
 }
 
 // workerRunning reports whether the retry worker is live; without it a
@@ -432,9 +448,10 @@ func (observer *Observer) workerRunning() bool {
 	return observer.workerActive
 }
 
-// committed records a successful submission: it advances lastSeen and the
-// durable cursor, counts the event, and notifies OnSubmit.
-func (observer *Observer) committed(event Event, result SubmitResult) {
+// committed records a successful submission: it advances lastSeen, counts the
+// event, notifies OnSubmit, and settles the cursor.  fromQueue says whether the
+// event came out of the retry queue (and so releases one pending slot).
+func (observer *Observer) committed(event Event, result SubmitResult, fromQueue bool) {
 	observer.mu.Lock()
 	if created := time.Unix(event.CreatedAt, 0); created.After(observer.lastSeen) {
 		observer.lastSeen = created
@@ -444,34 +461,78 @@ func (observer *Observer) committed(event Event, result SubmitResult) {
 	if observer.config.OnSubmit != nil {
 		observer.config.OnSubmit(event, result)
 	}
-	observer.advanceCursor(event)
+	observer.settle(event, fromQueue)
 	observer.config.Logger.Printf("relay observer: committed %s kind=%d height=%d", event.ID, event.Kind, result.Height)
 }
 
 // droppedEvent records a terminal rejection: the chain will never accept this
-// event, so it is dropped (not retried) and the cursor advances past it.
-func (observer *Observer) droppedEvent(event Event, err error) {
+// event, so it is dropped (not retried) and settled past.
+func (observer *Observer) droppedEvent(event Event, err error, fromQueue bool) {
 	observer.mu.Lock()
 	if created := time.Unix(event.CreatedAt, 0); created.After(observer.lastSeen) {
 		observer.lastSeen = created
 	}
 	observer.dropped++
 	observer.mu.Unlock()
-	observer.advanceCursor(event)
+	observer.settle(event, fromQueue)
 	observer.config.Logger.Printf("relay observer: dropping %s: terminal rejection: %v", event.ID, err)
 }
 
-// advanceCursor persists the resume point for this relay after an event is
-// settled (committed or terminally dropped).  A transient failure never calls
-// this, so a restart re-reads the event it could not submit.
-func (observer *Observer) advanceCursor(event Event) {
+// settle records that an event is settled (committed or terminally dropped) and
+// advances the durable cursor only once nothing is still queued or in flight.
+//
+// The cursor means "everything at or before this position is settled".  A crash
+// must never resume past an event the observer had not finished with, so a later
+// event settling out of order waits here until the older one drains, and the
+// highest settled position is then flushed in one go.  A transient failure never
+// reaches this function, so it is never persisted as settled.
+//
+// fromQueue says whether the event came out of the retry queue, which is what
+// releases one pending slot; an event submitted straight from the receive loop
+// was never pending.
+func (observer *Observer) settle(event Event, fromQueue bool) {
 	if observer.config.Cursor == nil {
 		return
 	}
-	if err := observer.config.Cursor.Advance(observer.config.URL, event.CreatedAt, event.ID); err != nil {
-		observer.recordError(fmt.Errorf("cursor advance %s: %w", event.ID, err))
-		observer.config.Logger.Printf("relay observer: cursor advance failed for %s: %v", event.ID, err)
+	position := cursorEntry{CreatedAt: event.CreatedAt, EventID: event.ID}
+	observer.mu.Lock()
+	if fromQueue && observer.pending > 0 {
+		observer.pending--
 	}
+	if !observer.settledSet || cursorAfter(position, observer.settled) {
+		observer.settled, observer.settledSet = position, true
+	}
+	if observer.pending > 0 {
+		// Something older is still unsettled: hold the position back rather
+		// than skip over it.
+		observer.mu.Unlock()
+		return
+	}
+	position, observer.settledSet = observer.settled, false
+	observer.mu.Unlock()
+	if err := observer.config.Cursor.Advance(observer.config.URL, position.CreatedAt, position.EventID); err != nil {
+		observer.recordError(fmt.Errorf("cursor advance %s: %w", position.EventID, err))
+		observer.config.Logger.Printf("relay observer: cursor advance failed for %s: %v", position.EventID, err)
+	}
+}
+
+// markPending registers an event handed to the retry queue as unsettled, so no
+// other event's success can advance the cursor past it.
+func (observer *Observer) markPending() {
+	if observer.config.Cursor == nil {
+		return
+	}
+	observer.mu.Lock()
+	observer.pending++
+	observer.mu.Unlock()
+}
+
+// cursorAfter reports whether a is a later position than b.
+func cursorAfter(a, b cursorEntry) bool {
+	if a.CreatedAt != b.CreatedAt {
+		return a.CreatedAt > b.CreatedAt
+	}
+	return a.EventID > b.EventID
 }
 
 // Stats reports how many events this observer committed, the newest created_at

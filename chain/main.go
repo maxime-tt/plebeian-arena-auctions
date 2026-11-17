@@ -46,14 +46,41 @@ type supervisor struct {
 	logs  string
 	procs [4]*exec.Cmd
 	want  [4]bool
+	// relays and commitMax are the gateway's per-node flags, kept so a validator
+	// restarted through the demo control comes back with the SAME command line
+	// (see nodeArgs).
+	relays    []string
+	commitMax time.Duration
+}
+
+// nodeArgs builds the argv for validator i (0-based).  It is the ONE place the
+// node command line is built, so the gateway's initial start and a demo-control
+// restart cannot drift: a restarted validator that lost its -relay flag comes
+// back with no relay observer (so no ingest), no verdict publisher, no state
+// commitments and no params event -- a second-class node that only p2p-syncs.
+func nodeArgs(root string, i int, relays []string, commitMax time.Duration) []string {
+	args := []string{"node", "-root", root, "-i", fmt.Sprint(i + 1)}
+	for _, relay := range relays {
+		args = append(args, "-relay", relay)
+	}
+	if commitMax > 0 {
+		args = append(args, "-commit-max-interval="+commitMax.String())
+	}
+	return args
+}
+
+// argsFor is the argv a start of validator i uses.  Both the initial start and
+// the demo-control restart go through here.
+func (s *supervisor) argsFor(i int) []string {
+	return nodeArgs(s.root, i, s.relays, s.commitMax)
 }
 
 func (s *supervisor) start(i int) error {
-	return s.startWith(i, []string{"node", "-root", s.root, "-i", fmt.Sprint(i + 1)})
+	return s.startWith(i, s.argsFor(i))
 }
 
-// startWith starts validator i with explicit arguments, so the gateway can pass
-// relay flags through to each node's ingest.
+// startWith starts validator i with explicit arguments; start(i) builds them via
+// argsFor.  It stays a separate entry point for tests.
 func (s *supervisor) startWith(i int, args []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,14 +164,9 @@ func cmdGateway(args []string) {
 	fs.Var(&relays, "relay", "relay websocket URL clients publish to (repeatable); the relay is the primary transport")
 	fs.Parse(args)
 	bin, _ := os.Executable()
-	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root)}
-	for i := 0; i < 4; i++ {
-		args := []string{"node", "-root", *root, "-i", fmt.Sprint(i+1)}
-		for _, relay := range relays {
-			args = append(args, "-relay", relay)
-		}
-		args = append(args, "-commit-max-interval="+commitMaxInterval.String())
-		check(sup.startWith(i, args))
+	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root), relays: relays, commitMax: *commitMaxInterval}
+	for i := range 4 {
+		check(sup.start(i))
 	}
 	publisher := newRelayPublisher(relays)
 
