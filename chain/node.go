@@ -52,6 +52,15 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 	// v0.4.0 (ADR 0003 §1): blocks only when there is something to commit,
 	// plus a heartbeat every minute. Bids no longer wait for a 1 s slot,
 	// and the auction closes are driven by the validators' close txs.
+	//
+	// The commit bound a client may rely on: CometBFT's handleTxsAvailable
+	// fires on the LOCAL TxsAvailable channel, so a tx must be in the current
+	// proposer's OWN mempool to be proposed promptly.  Both ingest paths
+	// therefore fan out to every validator's RPC (RPCSubmitter and /api/tx),
+	// which puts the tx in the proposer's mempool too; the block then lands
+	// within TimeoutCommit (300 ms) plus one round: <= 2 s.  A tx that only
+	// reaches a NON-proposer waits for CreateEmptyBlocksInterval below, which
+	// is why fan-out, not this interval, is the latency fix.
 	c.Consensus.TimeoutCommit = 300 * time.Millisecond
 	c.Consensus.TimeoutPropose = 1500 * time.Millisecond
 	c.Consensus.CreateEmptyBlocks = true
@@ -366,9 +375,16 @@ func cmdNode(args []string) {
 	go func() { log.Println(srv.ListenAndServe()) }()
 
 	// Relay ingest: subscribe to the configured relay(s) and submit every
-	// verified auction/bid event into THIS node's mempool.  One observer per
-	// relay, per validator; a client thus never has to know which node leads.
-	stopIngest, err := startRelayIngest(context.Background(), relays, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i)), log.Default())
+	// verified auction/bid event into the mempool of EVERY validator.  One
+	// observer per relay, per validator; a client thus never has to know which
+	// node leads, and the tx reaches the current proposer's own mempool (see
+	// RPCSubmitter for the latency bound).  The cursor file lets a restart
+	// resume from the last event it processed instead of re-reading the relay.
+	rpcURLs := make([]string, 0, 4)
+	for j := range 4 {
+		rpcURLs = append(rpcURLs, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(j)))
+	}
+	stopIngest, err := startRelayIngest(context.Background(), relays, rpcURLs, filepath.Join(home, "data", "relay-cursor.json"), log.Default())
 	check(err)
 	defer stopIngest()
 
