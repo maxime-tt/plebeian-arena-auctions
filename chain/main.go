@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -44,14 +46,41 @@ type supervisor struct {
 	logs  string
 	procs [4]*exec.Cmd
 	want  [4]bool
+	// relays and commitMax are the gateway's per-node flags, kept so a validator
+	// restarted through the demo control comes back with the SAME command line
+	// (see nodeArgs).
+	relays    []string
+	commitMax time.Duration
+}
+
+// nodeArgs builds the argv for validator i (0-based).  It is the ONE place the
+// node command line is built, so the gateway's initial start and a demo-control
+// restart cannot drift: a restarted validator that lost its -relay flag comes
+// back with no relay observer (so no ingest), no verdict publisher, no state
+// commitments and no params event -- a second-class node that only p2p-syncs.
+func nodeArgs(root string, i int, relays []string, commitMax time.Duration) []string {
+	args := []string{"node", "-root", root, "-i", fmt.Sprint(i + 1)}
+	for _, relay := range relays {
+		args = append(args, "-relay", relay)
+	}
+	if commitMax > 0 {
+		args = append(args, "-commit-max-interval="+commitMax.String())
+	}
+	return args
+}
+
+// argsFor is the argv a start of validator i uses.  Both the initial start and
+// the demo-control restart go through here.
+func (s *supervisor) argsFor(i int) []string {
+	return nodeArgs(s.root, i, s.relays, s.commitMax)
 }
 
 func (s *supervisor) start(i int) error {
-	return s.startWith(i, []string{"node", "-root", s.root, "-i", fmt.Sprint(i + 1)})
+	return s.startWith(i, s.argsFor(i))
 }
 
-// startWith starts validator i with explicit arguments, so the gateway can pass
-// relay flags through to each node's ingest.
+// startWith starts validator i with explicit arguments; start(i) builds them via
+// argsFor.  It stays a separate entry point for tests.
 func (s *supervisor) startWith(i int, args []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -130,17 +159,14 @@ func cmdGateway(args []string) {
 	addr := fs.String("addr", "127.0.0.1:8080", "listen addr")
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint")
 	demo := fs.Bool("demo-controls", false, "expose the unauthenticated validator stop/start route (demo only, never on a real-sats deployment)")
+	commitMaxInterval := fs.Duration("commit-max-interval", 10*time.Second, "maximum wall-clock gap between state commitments")
 	var relays relayURLs
 	fs.Var(&relays, "relay", "relay websocket URL clients publish to (repeatable); the relay is the primary transport")
 	fs.Parse(args)
 	bin, _ := os.Executable()
-	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root)}
-	for i := 0; i < 4; i++ {
-		args := []string{"node", "-root", *root, "-i", fmt.Sprint(i+1)}
-		for _, relay := range relays {
-			args = append(args, "-relay", relay)
-		}
-		check(sup.startWith(i, args))
+	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root), relays: relays, commitMax: *commitMaxInterval}
+	for i := range 4 {
+		check(sup.start(i))
 	}
 	publisher := newRelayPublisher(relays)
 
@@ -259,11 +285,14 @@ func cmdGateway(args []string) {
 		writeJSON(w, 200, out)
 	})
 
-	// Publish a signed Nostr event.  When the gateway is configured with a
-	// relay, the relay is the primary transport: the event goes there, every
-	// validator's observer ingests it into that validator's own mempool, and
-	// the gateway does not need to know which validator leads.  The direct
-	// submit below is kept as a fallback for a deployment with no relay.
+	// Publish a signed Nostr event.  The relay is the transport and the
+	// discovery mechanism, but it is NOT enough on its own: the event is always
+	// also submitted directly to every validator's RPC, so the tx reaches the
+	// current proposer's own mempool (see RPCSubmitter for the <= 2 s bound) and
+	// a restart of the observer hop cannot lose it.  A relay publish is best
+	// effort and never decides the answer.  ok:true means the tx was accepted
+	// into at least one mempool and is pollable by the hash that is always
+	// returned.
 	mu.HandleFunc("/api/tx", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil || r.Method != http.MethodPost {
@@ -275,71 +304,25 @@ func cmdGateway(args []string) {
 			writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 			return
 		}
-		tx := "0x" + hex.EncodeToString(compact.Bytes())
-
-		if publisher != nil {
-			var event Event
-			if json.Unmarshal(compact.Bytes(), &event) != nil || event.Verify() != nil {
-				writeJSON(w, 400, map[string]string{"error": "invalid signed event"})
-				return
-			}
-			if pubErr := publisher.Publish(r.Context(), event); pubErr == nil {
-				writeJSON(w, 200, map[string]any{"ok": true, "via": "relay"})
-				return
-			} else {
-				log.Printf("relay publish failed, falling back to direct submit: %v", pubErr)
-			}
-		}
-
-		for i := 0; i < 4; i++ {
-			if !sup.running(i) {
-				continue
-			}
-			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/broadcast_tx_sync?tx=%s", rpcPort(i), tx))
-			if err != nil {
-				continue
-			}
-			var rr struct {
-				Result *struct {
-					Code uint32 `json:"code"`
-					Log  string `json:"log"`
-					Hash string `json:"hash"`
-				} `json:"result"`
-				Error *struct {
-					Message string `json:"message"`
-					Data    string `json:"data"`
-				} `json:"error"`
-			}
-			json.NewDecoder(resp.Body).Decode(&rr)
-			resp.Body.Close()
-			if rr.Error != nil {
-				msg := rr.Error.Data
-				if msg == "" {
-					msg = rr.Error.Message
-				}
-				if strings.Contains(msg, "already exists in cache") {
-					writeJSON(w, 200, map[string]any{"ok": true, "via": names[i], "note": "already submitted"})
-					return
-				}
-				writeJSON(w, 400, map[string]any{"ok": false, "error": msg, "via": names[i]})
-				return
-			}
-			if rr.Result == nil {
-				continue
-			}
-			if rr.Result.Code != 0 {
-				writeJSON(w, 400, map[string]any{"ok": false, "error": rr.Result.Log, "via": names[i]})
-				return
-			}
-			out := map[string]any{"ok": true, "hash": rr.Result.Hash, "via": names[i]}
-			if strings.HasPrefix(rr.Result.Log, "late: ") {
-				// a late bid: on chain as void, refundable as soon as it lands (ADR 0007)
-				out["late"] = strings.TrimPrefix(rr.Result.Log, "late: ")
-			}
-			writeJSON(w, 200, out)
+		var event Event
+		if json.Unmarshal(compact.Bytes(), &event) != nil || event.Verify() != nil {
+			writeJSON(w, 400, map[string]string{"error": "invalid signed event"})
 			return
 		}
-		writeJSON(w, 503, map[string]string{"error": "no validator reachable"})
+		validators := make([]validatorRPC, 0, 4)
+		for i := range 4 {
+			if sup.running(i) {
+				validators = append(validators, validatorRPC{Name: names[i], URL: fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i))})
+			}
+		}
+		// Keep a nil publisher a nil interface, so submitTx skips the relay
+		// path entirely instead of logging "no relay configured".
+		var pub txPublisher
+		if publisher != nil {
+			pub = publisher
+		}
+		status, out := submitTx(r.Context(), client, validators, event, compact.Bytes(), pub)
+		writeJSON(w, status, out)
 	})
 
 	// relay a release request to every validator's signer; the browser assembles 3 of 4
@@ -473,4 +456,179 @@ func cmdGateway(args []string) {
 		os.Exit(0)
 	}()
 	log.Fatal(srv.ListenAndServe())
+}
+
+// validatorRPC names one validator's CometBFT RPC endpoint for the /api/tx
+// fan-out.
+type validatorRPC struct {
+	Name string
+	URL  string
+}
+
+// txHash is the CometBFT transaction hash of tx: sha256 over the raw tx bytes,
+// uppercase hex.  That is exactly what types.Tx(tx).Hash() reports and what a
+// client polls a tx by, so /api/tx can always return a hash even when no
+// validator's response carried one.
+func txHash(tx []byte) string {
+	sum := sha256.Sum256(tx)
+	return strings.ToUpper(hex.EncodeToString(sum[:]))
+}
+
+// broadcastOutcome is one validator's answer to broadcast_tx_sync.
+type broadcastOutcome struct {
+	kind    broadcastOutcomeKind
+	hash    string
+	note    string
+	late    string
+	message string
+}
+
+type broadcastOutcomeKind int
+
+const (
+	// broadcastAccepted: the tx is in this validator's mempool (or was already
+	// cached there).  A hash may be present.
+	broadcastAccepted broadcastOutcomeKind = iota
+	// broadcastTerminal: the application rejected the tx; no validator will
+	// accept it later.
+	broadcastTerminal
+	// broadcastTransient: a transport error, an RPC-layer error object (the
+	// node may be catching up), or an unreadable answer; the same submit may
+	// succeed later.
+	broadcastTransient
+)
+
+// broadcastTx submits tx to one validator's CometBFT RPC and classifies the
+// answer, mirroring RPCSubmitter's classification so the two transports agree.
+func broadcastTx(ctx context.Context, client *http.Client, rpcURL string, tx []byte) broadcastOutcome {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("%s/broadcast_tx_sync?tx=0x%s", rpcURL, hex.EncodeToString(tx)), nil)
+	if err != nil {
+		return broadcastOutcome{kind: broadcastTransient, message: err.Error()}
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return broadcastOutcome{kind: broadcastTransient, message: err.Error()}
+	}
+	defer response.Body.Close()
+
+	var rr struct {
+		Result *struct {
+			Code uint32 `json:"code"`
+			Log  string `json:"log"`
+			Hash string `json:"hash"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+			Data    string `json:"data"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&rr); err != nil {
+		return broadcastOutcome{kind: broadcastTransient, message: err.Error()}
+	}
+	if rr.Error != nil {
+		msg := rr.Error.Data
+		if msg == "" {
+			msg = rr.Error.Message
+		}
+		if strings.Contains(msg, "already exists in cache") {
+			return broadcastOutcome{kind: broadcastAccepted, note: "already submitted"}
+		}
+		return broadcastOutcome{kind: broadcastTransient, message: msg}
+	}
+	if rr.Result == nil {
+		return broadcastOutcome{kind: broadcastTransient, message: "broadcast returned no result"}
+	}
+	if rr.Result.Code != 0 {
+		return broadcastOutcome{kind: broadcastTerminal, message: rr.Result.Log}
+	}
+	out := broadcastOutcome{kind: broadcastAccepted, hash: rr.Result.Hash}
+	if strings.HasPrefix(rr.Result.Log, "late: ") {
+		// a late bid: on chain as void, refundable as soon as it lands (ADR 0007)
+		out.late = strings.TrimPrefix(rr.Result.Log, "late: ")
+	}
+	return out
+}
+
+// txPublisher is the relay side of /api/tx: *relayPublisher in production, a
+// fake in a test.  Keeping it an interface is what lets submitTx be exercised
+// with no relay and no network.
+type txPublisher interface {
+	Publish(ctx context.Context, event Event) error
+}
+
+// submitTx is the /api/tx body, extracted so it is unit-testable.  It publishes
+// the event to the relay when one is configured (best effort) and submits the tx
+// to EVERY validator's RPC, then reports the HTTP status and the JSON body.
+//
+// ok:true means "accepted and pollable": at least one validator took the tx into
+// its mempool, and the tx hash is always returned so the caller can poll it.  A
+// relay publish on its own is never ok.  With no acceptor, a terminal rejection
+// is a 400 and anything else (all transports down, nodes catching up) is a 503.
+func submitTx(ctx context.Context, client *http.Client, validators []validatorRPC, event Event, tx []byte, publisher txPublisher) (int, map[string]any) {
+	hash := txHash(tx)
+
+	// The relay is transport and discovery: every validator's observer picks the
+	// event up from there.  A relay failure is logged and ignored -- the direct
+	// fan-out below is what decides the answer.
+	if publisher != nil {
+		if err := publisher.Publish(ctx, event); err != nil {
+			log.Printf("relay publish failed: %v", err)
+		}
+	}
+
+	var (
+		accepted    []string
+		acceptedRPC string
+		note        string
+		late        string
+		terminal    string
+		terminalVia string
+		transient   string
+	)
+	for _, validator := range validators {
+		outcome := broadcastTx(ctx, client, validator.URL, tx)
+		switch outcome.kind {
+		case broadcastAccepted:
+			accepted = append(accepted, validator.Name)
+			if acceptedRPC == "" {
+				acceptedRPC = outcome.hash
+			}
+			if note == "" {
+				note = outcome.note
+			}
+			if late == "" {
+				late = outcome.late
+			}
+		case broadcastTerminal:
+			if terminal == "" {
+				terminal, terminalVia = outcome.message, validator.Name
+			}
+		case broadcastTransient:
+			if transient == "" {
+				transient = outcome.message
+			}
+		}
+	}
+
+	if len(accepted) > 0 {
+		if acceptedRPC != "" {
+			hash = acceptedRPC
+		}
+		out := map[string]any{"ok": true, "hash": hash, "via": strings.Join(accepted, ", ")}
+		if note != "" {
+			out["note"] = note
+		}
+		if late != "" {
+			out["late"] = late
+		}
+		return http.StatusOK, out
+	}
+	if terminal != "" {
+		return http.StatusBadRequest, map[string]any{"ok": false, "error": terminal, "via": terminalVia}
+	}
+	if transient == "" {
+		transient = "no validator reachable"
+	}
+	return http.StatusServiceUnavailable, map[string]any{"ok": false, "error": transient}
 }

@@ -13,6 +13,11 @@ package main
 //   - events are de-duplicated by id, so a republish (or a replay) commits once;
 //   - a reconnect re-subscribes from the last created_at actually seen, so a
 //     dropped connection loses nothing the relay still holds;
+//   - a transient submit refusal is retried with backoff in its own goroutine,
+//     so the receive loop keeps draining the socket and the event is not lost
+//     when the node is still catching up;
+//   - a durable per-relay cursor (relaycursor.go) lets a restart resume from the
+//     last event processed instead of re-reading the whole relay;
 //   - the last transport error and the live-subscription flag are exposed for
 //     readiness probes and tests.
 //
@@ -58,6 +63,14 @@ type ObserverConfig struct {
 	// advances as events are seen so a reconnect only re-fetches the window it
 	// might have missed.  Zero means "from the beginning of the relay".
 	Since *time.Time
+	// ResumeEventID is the id that goes with Since in the startup log, so an
+	// operator can see exactly which event a restart resumed after.  It is
+	// empty when Since is unknown.
+	ResumeEventID string
+	// Cursor records how far this relay has been processed, durably.  When set,
+	// it is advanced on a success or a terminal rejection, and never on a
+	// transient failure.  Nil disables cursor persistence.
+	Cursor CursorRecorder
 	// ReconnectDelay is how long to wait before retrying a dropped connection.
 	ReconnectDelay time.Duration
 	// OnSubmit, when set, is called after a successful submission.  It must not
@@ -78,8 +91,24 @@ type Observer struct {
 	lastSeen   time.Time
 	seenIDs    map[string]struct{}
 	submitted  int
+	dropped    int
 	lastError  error
 	subscribed bool
+
+	// queue holds events whose submit failed transiently, in arrival order; the
+	// retry worker drains it with exponential backoff.  workerOnce keeps exactly
+	// one worker per observer, however many times Run is entered.
+	queue        *retryQueue
+	workerOnce   sync.Once
+	workerActive bool
+
+	// pending is how many events are queued or in flight (unsettled); while it
+	// is non-zero the durable cursor must not move, or a restart would resume
+	// past an event that never reached the chain.  settled is the highest
+	// position seen settled while pending was non-zero, flushed once it drains.
+	pending    int
+	settled    cursorEntry
+	settledSet bool
 }
 
 // NewObserver validates configuration and returns an observer ready to Run.
@@ -99,15 +128,194 @@ func NewObserver(config ObserverConfig) (*Observer, error) {
 	if config.Logger == nil {
 		config.Logger = log.Default()
 	}
-	observer := &Observer{config: config, seenIDs: map[string]struct{}{}}
+	observer := &Observer{config: config, seenIDs: map[string]struct{}{}, queue: newRetryQueue()}
 	if config.Since != nil {
 		observer.lastSeen = *config.Since
 	}
 	return observer, nil
 }
 
+// retryBackoff is the first retry delay; it doubles up to retryBackoffMax.  A
+// refused submit is usually "the node is not ready yet", which clears in well
+// under a second, so the first attempt comes back quickly and only a node that
+// stays down waits the cap.
+const (
+	retryBackoff    = 250 * time.Millisecond
+	retryBackoffMax = 5 * time.Second
+)
+
+// retryQueue is an unbounded, arrival-ordered FIFO of events awaiting retry,
+// de-duplicated by id so a relay replay cannot queue a second copy.  next blocks
+// until an item is queued or ctx is done; it is not a channel so the receive
+// loop never blocks on a full buffer.
+type retryQueue struct {
+	mu    sync.Mutex
+	items []Event
+	ids   map[string]struct{}
+	wake  chan struct{}
+}
+
+func newRetryQueue() *retryQueue {
+	return &retryQueue{ids: map[string]struct{}{}, wake: make(chan struct{}, 1)}
+}
+
+// push appends the event unless its id is already queued, then wakes the worker.
+func (queue *retryQueue) push(event Event) {
+	queue.mu.Lock()
+	if _, queued := queue.ids[event.ID]; queued {
+		queue.mu.Unlock()
+		return
+	}
+	queue.ids[event.ID] = struct{}{}
+	queue.items = append(queue.items, event)
+	queue.mu.Unlock()
+	queue.signal()
+}
+
+// pushFront puts an event a worker took but could not finish back at the head,
+// preserving arrival order across a cancelled worker.
+func (queue *retryQueue) pushFront(event Event) {
+	queue.mu.Lock()
+	if _, queued := queue.ids[event.ID]; !queued {
+		queue.ids[event.ID] = struct{}{}
+		queue.items = append([]Event{event}, queue.items...)
+	}
+	queue.mu.Unlock()
+	queue.signal()
+}
+
+// next blocks until an event is queued or ctx is done.
+func (queue *retryQueue) next(ctx context.Context) (Event, bool) {
+	for {
+		queue.mu.Lock()
+		if len(queue.items) > 0 {
+			event := queue.items[0]
+			queue.items = queue.items[1:]
+			queue.mu.Unlock()
+			return event, true
+		}
+		queue.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return Event{}, false
+		case <-queue.wake:
+		}
+	}
+}
+
+// done forgets the queued id once the event is finished (committed or dropped).
+func (queue *retryQueue) done(id string) {
+	queue.mu.Lock()
+	delete(queue.ids, id)
+	queue.mu.Unlock()
+}
+
+// drain returns and clears everything still queued.
+func (queue *retryQueue) drain() []Event {
+	queue.mu.Lock()
+	items := queue.items
+	queue.items = nil
+	queue.ids = map[string]struct{}{}
+	queue.mu.Unlock()
+	return items
+}
+
+func (queue *retryQueue) signal() {
+	select {
+	case queue.wake <- struct{}{}:
+	default:
+	}
+}
+
+// startWorker starts the retry worker exactly once.  Run calls it for the whole
+// Run; RunRetriesForTest calls it so a test can retry without a socket.
+func (observer *Observer) startWorker(ctx context.Context) {
+	observer.workerOnce.Do(func() {
+		observer.mu.Lock()
+		observer.workerActive = true
+		observer.mu.Unlock()
+		go observer.retryWorker(ctx)
+	})
+}
+
+// RunRetriesForTest starts the transient-retry worker without opening a relay
+// socket, so a test can pair it with HandleForTest and exercise retry in
+// isolation.  Production code reaches the same worker through Run.
+func (observer *Observer) RunRetriesForTest(ctx context.Context) {
+	observer.startWorker(ctx)
+}
+
+// retryWorker drains the retry queue, retrying each event with exponential
+// backoff until it commits, is terminally rejected, or ctx is done.  It runs in
+// its own goroutine so the receive loop keeps draining the socket while a retry
+// is pending.  Anything still queued when it exits is handed back to the next
+// session's replay: its id is forgotten so the re-subscription is not skipped.
+func (observer *Observer) retryWorker(ctx context.Context) {
+	defer func() {
+		observer.forget(observer.queue.drain())
+		observer.mu.Lock()
+		observer.workerActive = false
+		// Nothing is queued or in flight any more, and the drained events were
+		// forgotten so the next session's replay re-reads them: the cursor
+		// stays behind them rather than being flushed past them.
+		observer.pending = 0
+		observer.settledSet = false
+		observer.mu.Unlock()
+	}()
+	for {
+		event, ok := observer.queue.next(ctx)
+		if !ok {
+			return
+		}
+		backoff := retryBackoff
+		for {
+			// The initial attempt already happened in handle; every retry here
+			// waits first, starting at 250 ms and doubling to the 5 s cap.
+			select {
+			case <-ctx.Done():
+				observer.queue.pushFront(event)
+				return
+			case <-time.After(backoff):
+			}
+			result, err := observer.config.Submitter.SubmitEvent(ctx, event)
+			if err == nil {
+				observer.queue.done(event.ID)
+				observer.committed(event, result, true)
+				break
+			}
+			if !IsTransientSubmit(err) {
+				observer.queue.done(event.ID)
+				observer.droppedEvent(event, err, true)
+				break
+			}
+			observer.recordError(fmt.Errorf("submit %s: %w", event.ID, err))
+			if backoff *= 2; backoff > retryBackoffMax {
+				backoff = retryBackoffMax
+			}
+			observer.config.Logger.Printf("relay observer: retrying %s in %s: %v", event.ID, backoff, err)
+		}
+	}
+}
+
+// forget removes ids from the in-memory dedupe set, so a later session's replay
+// re-handles an event the retry worker could not finish.
+func (observer *Observer) forget(events []Event) {
+	if len(events) == 0 {
+		return
+	}
+	observer.mu.Lock()
+	for _, event := range events {
+		delete(observer.seenIDs, event.ID)
+	}
+	observer.mu.Unlock()
+}
+
 // Run observes until ctx is cancelled, reconnecting on transport failure.
 func (observer *Observer) Run(ctx context.Context) error {
+	observer.startWorker(ctx)
+	if since, id := observer.resumePoint(); !since.IsZero() {
+		observer.config.Logger.Printf("relay observer: resuming from cursor %s (%s)", since.UTC().Format(time.RFC3339), id)
+	}
 	for {
 		if err := observer.session(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			observer.recordError(err)
@@ -119,6 +327,16 @@ func (observer *Observer) Run(ctx context.Context) error {
 		case <-time.After(observer.config.ReconnectDelay):
 		}
 	}
+}
+
+// resumePoint is the cursor value the observer starts from, if any: the
+// configured Since (seeded from the durable cursor) and the event id that goes
+// with it.
+func (observer *Observer) resumePoint() (time.Time, string) {
+	if observer.config.Since == nil {
+		return time.Time{}, ""
+	}
+	return *observer.config.Since, observer.config.ResumeEventID
 }
 
 // session runs one connection.  Every fresh subscription asks for events since
@@ -195,25 +413,126 @@ func (observer *Observer) handle(ctx context.Context, event *nostr.Event) {
 
 	result, err := observer.config.Submitter.SubmitEvent(ctx, signed)
 	if err != nil {
-		// Forget the id so a retry after a transient submit failure is
-		// attempted again on reconnect, instead of being silently marked done.
-		observer.mu.Lock()
-		delete(observer.seenIDs, event.ID)
-		observer.mu.Unlock()
 		observer.recordError(fmt.Errorf("submit %s: %w", event.ID, err))
-		observer.config.Logger.Printf("relay observer: submit failed for %s: %v", event.ID, err)
+		if IsTransientSubmit(err) {
+			if observer.workerRunning() {
+				// Keep the id in seenIDs: the event is queued, and a relay
+				// replay of it must not queue a second copy.  The retry worker
+				// owns it from here.
+				observer.config.Logger.Printf("relay observer: submit failed for %s (retrying): %v", event.ID, err)
+				// Mark it unsettled BEFORE queueing: a later event settling out
+				// of order must not advance the cursor past this one.
+				observer.markPending()
+				observer.queue.push(signed)
+				return
+			}
+			// No worker (a bare HandleForTest): keep the pre-retry behaviour of
+			// forgetting the id, so a reconnect's replay tries again.
+			observer.forget([]Event{signed})
+			observer.config.Logger.Printf("relay observer: submit failed for %s: %v", event.ID, err)
+			return
+		}
+		// A terminal rejection is an answer: drop the event, record it, and let
+		// the cursor move past it so it is never re-read.
+		observer.droppedEvent(signed, err, false)
 		return
 	}
+	observer.committed(signed, result, false)
+}
+
+// workerRunning reports whether the retry worker is live; without it a
+// transient failure has to fall back to the reconnect replay.
+func (observer *Observer) workerRunning() bool {
 	observer.mu.Lock()
-	if created := time.Unix(int64(event.CreatedAt), 0); created.After(observer.lastSeen) {
+	defer observer.mu.Unlock()
+	return observer.workerActive
+}
+
+// committed records a successful submission: it advances lastSeen, counts the
+// event, notifies OnSubmit, and settles the cursor.  fromQueue says whether the
+// event came out of the retry queue (and so releases one pending slot).
+func (observer *Observer) committed(event Event, result SubmitResult, fromQueue bool) {
+	observer.mu.Lock()
+	if created := time.Unix(event.CreatedAt, 0); created.After(observer.lastSeen) {
 		observer.lastSeen = created
 	}
 	observer.submitted++
 	observer.mu.Unlock()
 	if observer.config.OnSubmit != nil {
-		observer.config.OnSubmit(signed, result)
+		observer.config.OnSubmit(event, result)
 	}
+	observer.settle(event, fromQueue)
 	observer.config.Logger.Printf("relay observer: committed %s kind=%d height=%d", event.ID, event.Kind, result.Height)
+}
+
+// droppedEvent records a terminal rejection: the chain will never accept this
+// event, so it is dropped (not retried) and settled past.
+func (observer *Observer) droppedEvent(event Event, err error, fromQueue bool) {
+	observer.mu.Lock()
+	if created := time.Unix(event.CreatedAt, 0); created.After(observer.lastSeen) {
+		observer.lastSeen = created
+	}
+	observer.dropped++
+	observer.mu.Unlock()
+	observer.settle(event, fromQueue)
+	observer.config.Logger.Printf("relay observer: dropping %s: terminal rejection: %v", event.ID, err)
+}
+
+// settle records that an event is settled (committed or terminally dropped) and
+// advances the durable cursor only once nothing is still queued or in flight.
+//
+// The cursor means "everything at or before this position is settled".  A crash
+// must never resume past an event the observer had not finished with, so a later
+// event settling out of order waits here until the older one drains, and the
+// highest settled position is then flushed in one go.  A transient failure never
+// reaches this function, so it is never persisted as settled.
+//
+// fromQueue says whether the event came out of the retry queue, which is what
+// releases one pending slot; an event submitted straight from the receive loop
+// was never pending.
+func (observer *Observer) settle(event Event, fromQueue bool) {
+	if observer.config.Cursor == nil {
+		return
+	}
+	position := cursorEntry{CreatedAt: event.CreatedAt, EventID: event.ID}
+	observer.mu.Lock()
+	if fromQueue && observer.pending > 0 {
+		observer.pending--
+	}
+	if !observer.settledSet || cursorAfter(position, observer.settled) {
+		observer.settled, observer.settledSet = position, true
+	}
+	if observer.pending > 0 {
+		// Something older is still unsettled: hold the position back rather
+		// than skip over it.
+		observer.mu.Unlock()
+		return
+	}
+	position, observer.settledSet = observer.settled, false
+	observer.mu.Unlock()
+	if err := observer.config.Cursor.Advance(observer.config.URL, position.CreatedAt, position.EventID); err != nil {
+		observer.recordError(fmt.Errorf("cursor advance %s: %w", position.EventID, err))
+		observer.config.Logger.Printf("relay observer: cursor advance failed for %s: %v", position.EventID, err)
+	}
+}
+
+// markPending registers an event handed to the retry queue as unsettled, so no
+// other event's success can advance the cursor past it.
+func (observer *Observer) markPending() {
+	if observer.config.Cursor == nil {
+		return
+	}
+	observer.mu.Lock()
+	observer.pending++
+	observer.mu.Unlock()
+}
+
+// cursorAfter reports whether a is a later position than b.
+func cursorAfter(a, b cursorEntry) bool {
+	if a.CreatedAt != b.CreatedAt {
+		return a.CreatedAt > b.CreatedAt
+	}
+	return a.EventID > b.EventID
 }
 
 // Stats reports how many events this observer committed, the newest created_at
@@ -222,6 +541,13 @@ func (observer *Observer) Stats() (submitted int, lastSeen time.Time, lastError 
 	observer.mu.Lock()
 	defer observer.mu.Unlock()
 	return observer.submitted, observer.lastSeen, observer.lastError
+}
+
+// Dropped reports how many events were terminally rejected and dropped.
+func (observer *Observer) Dropped() int {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	return observer.dropped
 }
 
 // HandleForTest runs one event through the same verification and submission path

@@ -30,21 +30,33 @@ func (urls *relayURLs) Set(value string) error {
 }
 
 // startRelayIngest starts one observer per configured relay URL.  Each submits
-// into localRPC (this validator's own node) so the local mempool fills from the
-// relay without any client having to know which node is the leader.  The
-// returned stop function cancels every observer and waits for them to exit.
-func startRelayIngest(ctx context.Context, urls []string, localRPC string, logger *log.Logger) (func(), error) {
+// into every validator's RPC (see RPCSubmitter): a tx must reach the current
+// proposer's own mempool to produce a block promptly, and which validator
+// proposes is not known here.  The durable cursor at cursorPath is loaded once
+// and shared by every observer, and each observer resumes from the position its
+// relay was left at.  The returned stop function cancels every observer and
+// waits for them to exit.
+func startRelayIngest(ctx context.Context, urls []string, rpcURLs []string, cursorPath string, logger *log.Logger) (func(), error) {
 	if len(urls) == 0 {
 		return func() {}, nil
 	}
 	if logger == nil {
 		logger = log.Default()
 	}
+	cursor, err := loadRelayCursor(cursorPath)
+	if err != nil {
+		return nil, err
+	}
 	ingestContext, cancel := context.WithCancel(ctx)
 	var stops []func()
 	for _, url := range urls {
-		submitter := RPCSubmitter{RPCURL: localRPC, Timeout: 20 * time.Second}
-		observer, err := NewObserver(ObserverConfig{URL: url, Submitter: submitter, Logger: logger})
+		submitter := RPCSubmitter{URLs: rpcURLs, Timeout: 20 * time.Second}
+		config := ObserverConfig{URL: url, Submitter: submitter, Cursor: cursor, Logger: logger}
+		if since, eventID := cursor.since(url); !since.IsZero() {
+			config.Since = &since
+			config.ResumeEventID = eventID
+		}
+		observer, err := NewObserver(config)
 		if err != nil {
 			cancel()
 			for _, stop := range stops {
@@ -60,7 +72,7 @@ func startRelayIngest(ctx context.Context, urls []string, localRPC string, logge
 			}
 		}()
 		stops = append(stops, func() { <-done })
-		logger.Printf("relay ingest: %s -> %s", url, localRPC)
+		logger.Printf("relay ingest: %s -> %v", url, rpcURLs)
 	}
 	return func() {
 		cancel()
