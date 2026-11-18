@@ -1,7 +1,7 @@
 package main
 
 // The publish driver.  It reads the validator's COMMITTED snapshot and writes
-// five event classes back to the relay:
+// seven event classes back to the relay:
 //
 //   - a state pulse (kind 21447, EPHEMERAL) on EVERY pass, so a live subscriber
 //     can place the chain's clock even while nothing happens.  A pulse the
@@ -19,7 +19,13 @@ package main
 //   - a verdict (kind 1445) for each auction the chain has CLOSED;
 //   - a receipt (kind 1443 refund / 1444 settle, STORED) for each escrow the
 //     chain has MOVED, anchored to the SETTLE's committed height and time -- the
-//     money fact a relay-only client needs to claim the minted ecash.
+//     money fact a relay-only client needs to claim the minted ecash;
+//   - the lot's committed END (kind 1449, STORED) for each bid that extended a
+//     lot, anchored at THAT bid's height, and once for each closed lot, anchored
+//     at ClosedH -- so a late reader learns where the lot ended;
+//   - the chain's own refusal (kind 1450, STORED) for each committed rejection
+//     of a create or bid, carrying the reason VERBATIM and anchored at the
+//     rejecting block's height.
 //
 // THE ONE RULE THAT SHAPES THIS FILE: a claim is published only AFTER the block
 // that decides it is COMMITTED, anchored to a COMMITTED block's hash.  Step
@@ -48,6 +54,7 @@ import (
 	"encoding/json"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,13 +66,13 @@ import (
 // ordering on it: every verdict record carries the committed height it acted
 // at, so "published after commit" is checkable rather than merely claimed.
 type PublishRecord struct {
-	Op              string // "state_commitment" | "state_pulse" | "params" | "verdict" | "receipt" | "refused"
+	Op              string // "state_commitment" | "state_pulse" | "params" | "verdict" | "receipt" | "lot" | "refusal" | "refused"
 	CommittedHeight int64  // the app's committed height when Step ran
 	Height          int64  // the anchor height on the event
 	Hash            string // the anchor hash on the event
 	AuctionID       string
 	Outcome         string
-	Reason          string // for "refused"
+	Reason          string // "refused": why nothing was published; "refusal": the verbatim chain reason on the event
 	Error           string // set when the relay rejected the publish
 }
 
@@ -114,6 +121,8 @@ type Publisher struct {
 	mu               sync.Mutex
 	published        map[string]bool // auction id -> a verdict has been published
 	receipted        map[string]bool // bidID + "|" + outcome -> a receipt has been published (or can never be)
+	lots             map[string]bool // auctionID + "|" + end_time -> a lot event has been published
+	refusals         map[string]bool // event id + "|" + reason -> a refusal event has been published
 	lastCommitHeight int64           // committed height of the last commitment published
 	lastCommitTime   int64           // unix seconds (p.now) of the last commitment published
 	lastParams       string          // params digest of the last params event published
@@ -156,6 +165,8 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		every: every, maxInterval: maxInterval, now: now, log: logger,
 		published: map[string]bool{},
 		receipted: map[string]bool{},
+		lots:      map[string]bool{},
+		refusals:  map[string]bool{},
 	}, nil
 }
 
@@ -196,12 +207,15 @@ func (p *Publisher) Step(ctx context.Context) {
 	}
 	state.Height, state.Time = height, blockTime
 
-	// 1. Verdicts and receipts first: each one is a "meaningful change", and
-	//    each result joins the commitment gate below.  Both run on every pass;
-	//    neither may be skipped just because the other published something.
+	// 1. Verdicts, receipts, lot state and refusals first: each one is a
+	//    "meaningful change", and each result joins the commitment gate below.
+	//    All four run on every pass; none may be skipped just because another
+	//    published something.
 	publishedVerdict := p.publishVerdicts(ctx, state, height)
 	publishedReceipt := p.publishReceipts(ctx, state, height)
-	publishedClaim := publishedVerdict || publishedReceipt
+	publishedLots := p.publishLots(ctx, state, height)
+	publishedRefusals := p.publishRefusals(ctx, state, height)
+	publishedClaim := publishedVerdict || publishedReceipt || publishedLots || publishedRefusals
 
 	appHashHex := hexOrEmpty(appHash)
 	now := p.now()
@@ -471,6 +485,193 @@ func (p *Publisher) publishReceipts(ctx context.Context, state *State, height in
 		}
 		p.mu.Lock()
 		p.receipted[key] = true
+		p.mu.Unlock()
+		p.record(rec)
+		any = true
+	}
+	return any
+}
+
+// publishLots publishes the lot's COMMITTED END (kind 1449): once for every bid
+// that actually extended the lot, anchored at THAT bid's committed height and
+// that block's hash, and once for every closed lot, anchored at ClosedH.
+//
+// The two shapes answer two different questions.  A bid event says "this bid
+// moved the end to E at height H"; the per-bid pair is read from the bid
+// (EstablishedEnd/ExtensionOrdinal) because a later bid moves au.EndAt again --
+// the lot's CURRENT end cannot say what an earlier bid established.  A closed
+// lot event says "this is where the lot ended", so a late reader learns the
+// final end; a lot that never extended therefore publishes exactly one event at
+// close, with end_time == original_end_time and extensions == 0.
+//
+// Dedupe is per validator by (auction_id, end_time), and an event is marked
+// only AFTER a successful relay publish, so a transient relay failure retries.
+// If the anchor block's hash is not readable yet, nothing is published: the
+// refusal is recorded and retried next pass -- a claim the chain cannot anchor
+// is not published.
+func (p *Publisher) publishLots(ctx context.Context, state *State, height int64) bool {
+	bidIDs := make([]string, 0, len(state.Bids))
+	for id := range state.Bids {
+		bidIDs = append(bidIDs, id)
+	}
+	sort.Strings(bidIDs) // deterministic order across validators
+
+	any := false
+	// 1. Every bid that extended the lot: its own committed end and ordinal.
+	for _, id := range bidIDs {
+		bid := state.Bids[id]
+		if bid == nil || bid.EstablishedEnd <= 0 {
+			continue
+		}
+		au := state.Auctions[bid.Auction]
+		if au == nil {
+			// The bid names a lot the committed state does not hold; there is
+			// no original end to publish beside it, and inventing one would be
+			// a claim.  Skip: this cannot become publishable by retrying.
+			continue
+		}
+		key := bid.Auction + "|" + strconv.FormatInt(bid.EstablishedEnd, 10)
+		p.mu.Lock()
+		done := p.lots[key]
+		p.mu.Unlock()
+		if done {
+			continue
+		}
+		// THE ORDERING RULE: the anchor is the BID's committed height, not this
+		// pass's.  If the block hash is not readable, refuse and retry later.
+		blockHash, ok := p.blockHash(bid.Height)
+		if !ok || blockHash == "" {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: bid.Height,
+				AuctionID: bid.Auction, Reason: "committed_block_hash_unknown"})
+			continue
+		}
+		lc := LotContent{
+			AuctionID: bid.Auction, EndTime: bid.EstablishedEnd,
+			OriginalEndTime: au.OriginalEnd(), Extensions: bid.ExtensionOrdinal,
+			Height: bid.Height, BlockHash: blockHash,
+		}
+		ev, err := BuildLotEvent(p.key, lc, p.now())
+		if err != nil {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: bid.Height,
+				AuctionID: bid.Auction, Reason: err.Error()})
+			continue
+		}
+		rec := PublishRecord{Op: "lot", CommittedHeight: height, Height: bid.Height,
+			Hash: blockHash, AuctionID: bid.Auction}
+		if err := p.relay.Publish(ctx, ev); err != nil {
+			// Do NOT mark it published: a transient relay failure retries.
+			rec.Error = err.Error()
+			p.record(rec)
+			continue
+		}
+		p.mu.Lock()
+		p.lots[key] = true
+		p.mu.Unlock()
+		p.record(rec)
+		any = true
+	}
+
+	// 2. Every closed lot: its FINAL end, anchored at the block that closed it.
+	auctionIDs := make([]string, 0, len(state.Auctions))
+	for id := range state.Auctions {
+		auctionIDs = append(auctionIDs, id)
+	}
+	sort.Strings(auctionIDs)
+	for _, id := range auctionIDs {
+		au := state.Auctions[id]
+		if au == nil || au.Status != "closed" || au.ClosedH <= 0 {
+			continue
+		}
+		key := au.ID + "|" + strconv.FormatInt(au.EndAt, 10)
+		p.mu.Lock()
+		done := p.lots[key]
+		p.mu.Unlock()
+		if done {
+			continue
+		}
+		blockHash, ok := p.blockHash(au.ClosedH)
+		if !ok || blockHash == "" {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: au.ClosedH,
+				AuctionID: au.ID, Reason: "committed_block_hash_unknown"})
+			continue
+		}
+		lc := LotContent{
+			AuctionID: au.ID, EndTime: au.EndAt, OriginalEndTime: au.OriginalEnd(),
+			Extensions: au.Extensions, Height: au.ClosedH, BlockHash: blockHash,
+		}
+		ev, err := BuildLotEvent(p.key, lc, p.now())
+		if err != nil {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: au.ClosedH,
+				AuctionID: au.ID, Reason: err.Error()})
+			continue
+		}
+		rec := PublishRecord{Op: "lot", CommittedHeight: height, Height: au.ClosedH,
+			Hash: blockHash, AuctionID: au.ID}
+		if err := p.relay.Publish(ctx, ev); err != nil {
+			rec.Error = err.Error()
+			p.record(rec)
+			continue
+		}
+		p.mu.Lock()
+		p.lots[key] = true
+		p.mu.Unlock()
+		p.record(rec)
+		any = true
+	}
+	return any
+}
+
+// publishRefusals publishes the chain's OWN reason (kind 1450) for every
+// committed rejection of an auction event -- create (1440) or bid (1441) -- so
+// a client whose event was dropped can read why, carrying the reason VERBATIM
+// and anchored at the rejection's own committed height and that block's hash.
+//
+// state.Rejections is capped at 50 entries by the chain itself, so this pass is
+// bounded.  Dedupe is per validator by (event id, reason); the map is
+// in-memory, exactly like the verdict map above, so a process restart
+// republishes the current rejections once -- the bound on that re-publish is
+// the chain's own 50-entry cap.  A relay failure does not mark, so it retries;
+// an unreadable anchor hash records a refusal and retries next pass.
+func (p *Publisher) publishRefusals(ctx context.Context, state *State, height int64) bool {
+	any := false
+	for _, rej := range state.Rejections {
+		if (rej.Kind != KindCreate && rej.Kind != KindBid) || rej.Event == "" || rej.Reason == "" {
+			continue // only auction traffic the client acts on, with a reason to state
+		}
+		if rej.Height <= 0 {
+			continue // no block to anchor to: nothing can ever be published
+		}
+		key := rej.Event + "|" + rej.Reason
+		p.mu.Lock()
+		done := p.refusals[key]
+		p.mu.Unlock()
+		if done {
+			continue
+		}
+		blockHash, ok := p.blockHash(rej.Height)
+		if !ok || blockHash == "" {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: rej.Height,
+				Reason: "committed_block_hash_unknown"})
+			continue
+		}
+		rc := RefusedContent{EventID: rej.Event, Kind: rej.Kind, Reason: rej.Reason,
+			Height: rej.Height, BlockHash: blockHash}
+		ev, err := BuildRefusedEvent(p.key, rc, p.now())
+		if err != nil {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: rej.Height,
+				Reason: err.Error()})
+			continue
+		}
+		rec := PublishRecord{Op: "refusal", CommittedHeight: height, Height: rej.Height,
+			Hash: blockHash, Reason: rej.Reason}
+		if err := p.relay.Publish(ctx, ev); err != nil {
+			// Do NOT mark it published: a transient relay failure retries.
+			rec.Error = err.Error()
+			p.record(rec)
+			continue
+		}
+		p.mu.Lock()
+		p.refusals[key] = true
 		p.mu.Unlock()
 		p.record(rec)
 		any = true

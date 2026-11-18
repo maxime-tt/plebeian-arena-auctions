@@ -50,6 +50,8 @@ const (
 	KindFundingAbort = 1446 // funding abort
 	KindStateCommit  = 1447 // state commitment: the STORED anchor that proves a chain of time
 	KindParams       = 1448 // state params: the escrow terms committed in the app hash the event names
+	KindLot          = 1449 // lot state: the committed end of a lot and the bid that moved it
+	KindRefused      = 1450 // refusal: the chain's own reason for dropping a client event
 	// KindStatePulse is the ephemeral heartbeat twin of the 1447 commitment: a
 	// (height, app_hash, time) tick published on every publish pass so a live
 	// subscriber can place the chain's clock. NIP-01 EPHEMERAL (20000-29999):
@@ -70,6 +72,8 @@ var AuctionKinds = map[string]int{
 	"funding_abort": KindFundingAbort,
 	"state_commit":  KindStateCommit,
 	"params":        KindParams,
+	"lot":           KindLot,
+	"refused":       KindRefused,
 	"state_pulse":   KindStatePulse,
 }
 
