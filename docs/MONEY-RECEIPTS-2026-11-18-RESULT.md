@@ -9,7 +9,7 @@ and proven again from the live relay; the app's own decoder parses the live even
 | | |
 |---|---|
 | Branch | `feat/validator-workstreams` |
-| Code state | `ab5d23b` (receipts `9382631`, hardening `d24ba46`, merge `3268792`, probe `17fb264`, failure posture `c827e64`, probe phase 2 `ab5d23b`) |
+| Code state | receipts `9382631`, hardening `d24ba46`, merge `3268792`, probe phase 1 `17fb264`, failure posture `c827e64`, probe phase 2 `ab5d23b`, gofmt `4a15595` |
 | Base | `738413c`, plus `9d08340` (the cadence fix, merged as asked) |
 | Gates | Go **160 pass / 0 fail / 0 skip** (was 145 after the cadence merge), `go vet` clean |
 | Live acceptance | probe **51/0** on a fresh root and again on the live deployment; `tests/e2e.mjs` **65/0** |
