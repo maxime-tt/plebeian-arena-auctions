@@ -351,41 +351,52 @@ func TestSettleReceiptRidesARealPayout(t *testing.T) {
 	}
 }
 
-// 9. A bid whose settle predates SettledHeight is refused ONCE and never
-// retried across repeated passes.
-func TestReceiptPredatingSettledHeightRefusedOnce(t *testing.T) {
-	a, m, id := liveApp(t)
-	alice, bob := newBidder(t), newBidder(t)
-	ev1, tx1 := m.bidTx(t, a, alice, id, 150, "aa")
-	_, tx2 := m.bidTx(t, a, bob, id, 200, "bb")
-	finalize(t, a, 11, tNow+1, tx1, tx2)
-	st := mintMove(t, a, m, ev1.ID, "refund", alice.wallet, tNow+2)
-	finalize(t, a, 12, tNow+2, makeSettle(st))
+// 9. A settle with no committed WHEN -- the shape of every settle record on the
+// live root today -- is refused ONCE and never retried across repeated passes.
+// Both shapes are covered: no when at all, and a height with no time, which
+// could not be anchored either because the receipt carries both.
+func TestReceiptWithoutTheSettleWhenRefusedOnce(t *testing.T) {
+	for _, shape := range []struct {
+		name       string
+		height, at int64
+	}{
+		{"no height and no time", 0, 0},
+		{"a height but no time", 12, 0},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			a, m, id := liveApp(t)
+			alice, bob := newBidder(t), newBidder(t)
+			ev1, tx1 := m.bidTx(t, a, alice, id, 150, "aa")
+			_, tx2 := m.bidTx(t, a, bob, id, 200, "bb")
+			finalize(t, a, 11, tNow+1, tx1, tx2)
+			st := mintMove(t, a, m, ev1.ID, "refund", alice.wallet, tNow+2)
+			finalize(t, a, 12, tNow+2, makeSettle(st))
 
-	// The shape of every settle record on the live root today: Settled and Out
-	// set, the new when fields absent.
-	a.st.Bids[ev1.ID].SettledHeight = 0
-	a.st.Bids[ev1.ID].SettledAt = 0
-	a.committed = a.st.canonical()
+			// Settled and Out set, the when fields missing or partial.
+			a.st.Bids[ev1.ID].SettledHeight = shape.height
+			a.st.Bids[ev1.ID].SettledAt = shape.at
+			a.committed = a.st.canonical()
 
-	rec := &recordingRelay{}
-	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 3 })
-	ctx := context.Background()
-	pub.Step(ctx)
-	pub.Step(ctx)
-	pub.Step(ctx)
+			rec := &recordingRelay{}
+			pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 3 })
+			ctx := context.Background()
+			pub.Step(ctx)
+			pub.Step(ctx)
+			pub.Step(ctx)
 
-	if got := len(eventsOfKind(rec, KindRefund)); got != 0 {
-		t.Fatalf("a settle that predates settledHeight must not be published, got %d events", got)
-	}
-	refusals := 0
-	for _, r := range pub.Records() {
-		if r.Op == "refused" && r.Reason == "settle_predates_settled_height" {
-			refusals++
-		}
-	}
-	if refusals != 1 {
-		t.Fatalf("refusals = %d, want exactly 1 across three passes", refusals)
+			if got := len(eventsOfKind(rec, KindRefund)); got != 0 {
+				t.Fatalf("a settle without its block when must not be published, got %d events", got)
+			}
+			refusals := 0
+			for _, r := range pub.Records() {
+				if r.Op == "refused" && r.Reason == "settle_has_no_block_when" {
+					refusals++
+				}
+			}
+			if refusals != 1 {
+				t.Fatalf("refusals = %d, want exactly 1 across three passes", refusals)
+			}
+		})
 	}
 }
 

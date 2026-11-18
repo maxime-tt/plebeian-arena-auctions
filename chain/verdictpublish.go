@@ -394,15 +394,20 @@ func (p *Publisher) publishReceipts(ctx context.Context, state *State, height in
 		if done {
 			continue
 		}
-		// A settle that predates settledHeight can never be anchored: record ONE
-		// refusal and mark it so it is not retried on every pass (the live root
-		// has such bids; an unmarked retry would append records forever).
-		if bid.SettledHeight <= 0 {
+		// A settle with no committed WHEN -- recorded before settledHeight
+		// existed, as every settle on the live root is -- can never be anchored:
+		// there is no height whose block hash proves it.  Both fields are checked
+		// because a record that names a height but no time could not be built
+		// either, and this branch is the one place a receipt is marked
+		// unpublishable, so it must not leave a shape that retries forever.
+		// Record ONE refusal and mark it: the alternative is a record per pass,
+		// for as long as the process lives.
+		if bid.SettledHeight <= 0 || bid.SettledAt <= 0 {
 			p.mu.Lock()
 			p.receipted[key] = true
 			p.mu.Unlock()
 			p.record(PublishRecord{Op: "refused", CommittedHeight: height, AuctionID: bid.Auction,
-				Outcome: bid.Settled, Reason: "settle_predates_settled_height"})
+				Outcome: bid.Settled, Reason: "settle_has_no_block_when"})
 			continue
 		}
 		// THE ORDERING RULE: the anchor is the SETTLE's committed height.  The
