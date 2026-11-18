@@ -511,15 +511,17 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 	}
 	p := s.Params
 	switch {
-	case len(strings.TrimSpace(c.Title)) == 0 || len(c.Title) > 120:
-		return errors.New("title required (max 120 chars)")
-	case len(c.Description) > 2000 || len(c.Image) > 500 || len(c.Category) > 40 || len(c.Name) > 40:
+	case len(strings.TrimSpace(c.Title)) == 0 || len(c.Title) > MaxTitleChars:
+		// The bound is formatted from the constant: the reason text a refusal
+		// carries must never advertise a limit the check does not enforce.
+		return fmt.Errorf("title required (max %d chars)", MaxTitleChars)
+	case len(c.Description) > MaxDescriptionChars || len(c.Image) > MaxImageChars || len(c.Category) > MaxCategoryChars || len(c.Name) > MaxNameChars:
 		return errors.New("field too long")
 	case !safeImage(c.Image):
 		return errors.New("image must be a same-site path or an https URL")
-	case c.StartPrice < 1 || c.StartPrice > 10_000_000:
+	case c.StartPrice < MinStartPrice || c.StartPrice > MaxStartPrice:
 		return errors.New("start price out of range")
-	case c.MinIncrement < 1 || c.MinIncrement > 1_000_000:
+	case c.MinIncrement < MinIncrement || c.MinIncrement > MaxIncrement:
 		return errors.New("increment out of range")
 	case c.DurationSec < p.MinDurationSec || c.DurationSec > p.MaxDurationSec:
 		return fmt.Errorf("duration must be %d-%d seconds", p.MinDurationSec, p.MaxDurationSec)
