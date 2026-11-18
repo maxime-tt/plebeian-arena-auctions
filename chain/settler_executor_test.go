@@ -127,7 +127,7 @@ func TestFailedSpendLeavesTheObligationDue(t *testing.T) {
 	s.mint, s.hc = srv.URL, &http.Client{}
 	s.rc = &releaseCoordinator{groupKey: a.st.Params.GroupKey,
 		post: func(int, string, any, any) (int, error) { return 0, errors.New("validator offline") }}
-	if err := s.settle(due(tNow+2)[0], 12); err == nil {
+	if err := s.settle(due(tNow + 2)[0], 12); err == nil {
 		t.Fatal("a settle whose committee half cannot be collected must fail")
 	}
 
