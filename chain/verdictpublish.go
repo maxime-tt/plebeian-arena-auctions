@@ -1,21 +1,25 @@
 package main
 
 // The publish driver.  It reads the validator's COMMITTED snapshot and writes
-// four event classes back to the relay:
+// five event classes back to the relay:
 //
 //   - a state pulse (kind 21447, EPHEMERAL) on EVERY pass, so a live subscriber
 //     can place the chain's clock even while nothing happens.  A pulse the
 //     relay drops for having no listener is a non-event (owner ruling, handover
 //     §8.1): it is not retried, not logged as an error and gates nothing;
-//   - a state commitment (kind 1447, STORED) whenever a verdict is published, on
-//     the first pass, whenever the committed HEIGHT MOVES, and on the
-//     StateCommitMaxInterval heartbeat when the chain is otherwise idle -- so
-//     the committed clock can never go stale by more than that wall-clock gap
-//     (handover §1).  This is the anchor that proves a chain of time;
+//   - a state commitment (kind 1447, STORED) whenever a claim (a verdict or a
+//     receipt) is published, on the first pass, whenever the committed HEIGHT
+//     MOVES, and on the StateCommitMaxInterval heartbeat when the chain is
+//     otherwise idle -- so the committed clock can never go stale by more than
+//     that wall-clock gap (handover §1).  This is the anchor that proves a chain
+//     of time;
 //   - a params event (kind 1448, STORED) when the escrow terms change or on the
 //     Publisher.every block cadence, anchored to the SAME (height, app_hash) as
 //     the commitment published in the same pass (handover §4);
-//   - a verdict (kind 1445) for each auction the chain has CLOSED.
+//   - a verdict (kind 1445) for each auction the chain has CLOSED;
+//   - a receipt (kind 1443 refund / 1444 settle, STORED) for each escrow the
+//     chain has MOVED, anchored to the SETTLE's committed height and time -- the
+//     money fact a relay-only client needs to claim the minted ecash.
 //
 // THE ONE RULE THAT SHAPES THIS FILE: a claim is published only AFTER the block
 // that decides it is COMMITTED, anchored to a COMMITTED block's hash.  Step
@@ -55,7 +59,7 @@ import (
 // ordering on it: every verdict record carries the committed height it acted
 // at, so "published after commit" is checkable rather than merely claimed.
 type PublishRecord struct {
-	Op              string // "state_commitment" | "state_pulse" | "params" | "verdict" | "refused"
+	Op              string // "state_commitment" | "state_pulse" | "params" | "verdict" | "receipt" | "refused"
 	CommittedHeight int64  // the app's committed height when Step ran
 	Height          int64  // the anchor height on the event
 	Hash            string // the anchor hash on the event
@@ -109,6 +113,7 @@ type Publisher struct {
 
 	mu               sync.Mutex
 	published        map[string]bool // auction id -> a verdict has been published
+	receipted        map[string]bool // bidID + "|" + outcome -> a receipt has been published (or can never be)
 	lastCommitHeight int64           // committed height of the last commitment published
 	lastCommitTime   int64           // unix seconds (p.now) of the last commitment published
 	lastParams       string          // params digest of the last params event published
@@ -150,6 +155,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		key: cfg.Key, relay: cfg.Relay, app: cfg.App, blockHash: cfg.BlockHash,
 		every: every, maxInterval: maxInterval, now: now, log: logger,
 		published: map[string]bool{},
+		receipted: map[string]bool{},
 	}, nil
 }
 
@@ -190,8 +196,12 @@ func (p *Publisher) Step(ctx context.Context) {
 	}
 	state.Height, state.Time = height, blockTime
 
-	// 1. Verdicts first: each one is a "meaningful change".
+	// 1. Verdicts and receipts first: each one is a "meaningful change", and
+	//    each result joins the commitment gate below.  Both run on every pass;
+	//    neither may be skipped just because the other published something.
 	publishedVerdict := p.publishVerdicts(ctx, state, height)
+	publishedReceipt := p.publishReceipts(ctx, state, height)
+	publishedClaim := publishedVerdict || publishedReceipt
 
 	appHashHex := hexOrEmpty(appHash)
 	now := p.now()
@@ -216,7 +226,7 @@ func (p *Publisher) Step(ctx context.Context) {
 	//    committed height moved, the heartbeat elapsed, or params need an anchor
 	//    to ride.  The heartbeat is the point of the change: blocks are produced
 	//    on demand, so a block-height cadence alone has no wall-time bound.
-	needCommit := publishedVerdict || p.lastCommitTime == 0 || height != p.lastCommitHeight ||
+	needCommit := publishedClaim || p.lastCommitTime == 0 || height != p.lastCommitHeight ||
 		now-p.lastCommitTime >= int64(p.maxInterval/time.Second) || needParams
 	p.mu.Unlock()
 
@@ -351,6 +361,111 @@ func (p *Publisher) publishVerdicts(ctx context.Context, state *State, height in
 		}
 		p.mu.Lock()
 		p.published[id] = true
+		p.mu.Unlock()
+		p.record(rec)
+		any = true
+	}
+	return any
+}
+
+// publishReceipts publishes one receipt per settled escrow, anchored to the
+// SETTLE's committed height and that block's time -- the moment money moved,
+// not the publishing pass's height.  It returns whether anything was published,
+// so the caller can publish a commitment to accompany the change.  A receipt is
+// a receipt, not a heartbeat: it is published once per (bid, outcome), never on
+// a cadence.
+func (p *Publisher) publishReceipts(ctx context.Context, state *State, height int64) bool {
+	ids := make([]string, 0, len(state.Bids))
+	for id := range state.Bids {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // deterministic order across validators
+
+	any := false
+	for _, id := range ids {
+		bid := state.Bids[id]
+		if bid == nil || bid.Settled == "" {
+			continue
+		}
+		key := bid.ID + "|" + bid.Settled
+		p.mu.Lock()
+		done := p.receipted[key]
+		p.mu.Unlock()
+		if done {
+			continue
+		}
+		// A settle that predates settledHeight can never be anchored: record ONE
+		// refusal and mark it so it is not retried on every pass (the live root
+		// has such bids; an unmarked retry would append records forever).
+		if bid.SettledHeight <= 0 {
+			p.mu.Lock()
+			p.receipted[key] = true
+			p.mu.Unlock()
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, AuctionID: bid.Auction,
+				Outcome: bid.Settled, Reason: "settle_predates_settled_height"})
+			continue
+		}
+		// THE ORDERING RULE: the anchor is the SETTLE's committed height.  The
+		// production BlockHash reads the CometBFT BlockStore, which answers any
+		// retained past height.  If it is not readable, refuse and retry later.
+		blockHash, ok := p.blockHash(bid.SettledHeight)
+		if !ok || blockHash == "" {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: bid.SettledHeight,
+				AuctionID: bid.Auction, Outcome: bid.Settled, Reason: "committed_block_hash_unknown"})
+			continue
+		}
+		var kind int
+		var schema string
+		switch bid.Settled {
+		case "refund":
+			kind, schema = KindRefund, RefundSchema
+		case "settle":
+			kind, schema = KindSettle, SettleSchema
+		default:
+			// An unknown outcome can never be published: mark it so it is not
+			// retried forever.
+			p.mu.Lock()
+			p.receipted[key] = true
+			p.mu.Unlock()
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: bid.SettledHeight,
+				AuctionID: bid.Auction, Outcome: bid.Settled, Reason: "unknown_settled_outcome"})
+			continue
+		}
+		out, err := receiptOutputs(bid.Out)
+		if err != nil {
+			p.mu.Lock()
+			p.receipted[key] = true
+			p.mu.Unlock()
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: bid.SettledHeight,
+				AuctionID: bid.Auction, Outcome: bid.Settled, Reason: err.Error()})
+			continue
+		}
+		rc := ReceiptContent{
+			Schema: schema, AuctionID: bid.Auction, BidID: bid.ID, Outcome: bid.Settled,
+			Height: bid.SettledHeight, BlockHash: blockHash, SettledAt: bid.SettledAt,
+			ParamsVersion: paramsVersion(state.Params), Out: out,
+		}
+		var ev *Event
+		if kind == KindRefund {
+			ev, err = BuildRefundEvent(p.key, rc, p.now())
+		} else {
+			ev, err = BuildSettleEvent(p.key, rc, p.now())
+		}
+		rec := PublishRecord{Op: "receipt", CommittedHeight: height, Height: bid.SettledHeight,
+			Hash: blockHash, AuctionID: bid.Auction, Outcome: bid.Settled}
+		if err != nil {
+			rec.Error = err.Error()
+			p.record(rec)
+			continue
+		}
+		if err := p.relay.Publish(ctx, ev); err != nil {
+			// Do NOT mark it receipted: a transient relay failure retries.
+			rec.Error = err.Error()
+			p.record(rec)
+			continue
+		}
+		p.mu.Lock()
+		p.receipted[key] = true
 		p.mu.Unlock()
 		p.record(rec)
 		any = true
