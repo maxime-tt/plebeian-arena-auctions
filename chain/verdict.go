@@ -306,6 +306,28 @@ type ParamsContent struct {
 	MaxProofs                int            `json:"max_proofs"`
 	Threshold                int            `json:"threshold"`
 	Validators               []ValidatorKey `json:"validators"`
+
+	// The create-content rules below are CODE, not committed terms: they are
+	// the limits applyCreate enforces on every kind-1440 create, published
+	// here so a relay-only client can pre-validate a create against the same
+	// numbers the chain enforces instead of discovering a refusal afterwards.
+	// They are built from the constants in createrules.go, so a client reads
+	// them as the rules THIS validator builds its params events with.
+	//
+	// They are deliberately NOT in Params: paramsVersion digests Params, and
+	// these rules are not part of the app hash, so publishing them must leave
+	// every params_version unchanged.  A client that wants the committed terms
+	// reads params_version; these tell it what the chain will accept next.
+	MaxTitleChars       int    `json:"max_title_chars"`
+	MaxDescriptionChars int    `json:"max_description_chars"`
+	MaxImageChars       int    `json:"max_image_chars"`
+	MaxCategoryChars    int    `json:"max_category_chars"`
+	MaxNameChars        int    `json:"max_name_chars"`
+	ImageRule           string `json:"image_rule"`
+	StartPriceMin       int64  `json:"start_price_min"`
+	StartPriceMax       int64  `json:"start_price_max"`
+	IncrementMin        int64  `json:"increment_min"`
+	IncrementMax        int64  `json:"increment_max"`
 }
 
 // paramsVersion is the CONTENT DIGEST of a Params value: the sha256 hex of its
@@ -578,6 +600,13 @@ func BuildParamsEvent(sk *btcec.PrivateKey, p Params, height int64, appHashHex s
 		MinWindowSec: p.MinWindowSec, MaxWindowSec: p.MaxWindowSec,
 		MinDurationSec: p.MinDurationSec, MaxDurationSec: p.MaxDurationSec,
 		MaxProofs: p.MaxProofs, Threshold: p.Threshold, Validators: p.Validators,
+		// From createrules.go: the same constants applyCreate enforces, never a
+		// second copy of the numbers.
+		MaxTitleChars: MaxTitleChars, MaxDescriptionChars: MaxDescriptionChars,
+		MaxImageChars: MaxImageChars, MaxCategoryChars: MaxCategoryChars, MaxNameChars: MaxNameChars,
+		ImageRule:     ImageRule,
+		StartPriceMin: MinStartPrice, StartPriceMax: MaxStartPrice,
+		IncrementMin: MinIncrement, IncrementMax: MaxIncrement,
 	}
 	body, err := json.Marshal(c)
 	if err != nil {
