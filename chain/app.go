@@ -119,8 +119,16 @@ type Bid struct {
 	// template that re-locks to the committee key is forbidden (spec §4).
 	OutcomeTemplates *sigAllOutcomeTemplates `json:"outcome_templates,omitempty"`
 	// Push settlement (ADR 0009): the validators moved the escrow themselves.
-	Settled string  `json:"settled,omitempty"` // refund | payout, once the new ecash is minted
+	Settled string  `json:"settled,omitempty"` // refund | settle: the committed outcome template applied (parseSettle's bound)
 	Out     []Proof `json:"out,omitempty"`     // that ecash, P2PK-locked to the recipient
+	// The WHEN of the settle (A1b): the committed height the settle tx landed at
+	// and that block's time.  omitempty is MANDATORY, not style: snapshot.go's
+	// load path refuses any state whose canonical encoding does not re-encode
+	// byte-identically, so a field without it would make every existing
+	// data/app-state/*.json unreadable and stop the live root restarting.  Both
+	// zero on every bid that has not settled, so an old snapshot loads as-is.
+	SettledHeight int64 `json:"settledHeight,omitempty"` // the committed height the settle tx landed at
+	SettledAt     int64 `json:"settledAt,omitempty"`     // that block's time (unix seconds)
 }
 
 type Rejection struct {

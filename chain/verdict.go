@@ -1,9 +1,19 @@
 package main
 
-// The verdict-publish path: the WRITE half of the Nostr transport (kind 1445)
-// and the periodic state commitment (kind 1447).  See
+// The verdict-publish path: the WRITE half of the Nostr transport.  It
+// publishes a validator's verdicts (kind 1445), the periodic state commitment
+// (kind 1447), the ephemeral state pulse (kind 21447), the escrow TERMS
+// (kind 1448), and the money RECEIPTS (kind 1443 refund / 1444 settle).  See
 // notes/REPLY-nostr-verdict-contract.md and MERGED-PROTOCOL-SPEC.md §9, which
 // fix this contract.
+//
+// THE RECEIPTS ARE THE MONEY FACTS.  A verdict CLAIMS an outcome; a receipt
+// CARRIES the minted outputs the claim implies, so a client can claim the ecash
+// from the relay alone (handover §3).  The out list MAY be published: every
+// proof in it is P2PK-locked to the committed recipient named beside it, and
+// spending needs that key, so the secret is not a bearer instrument here.  A
+// receipt is anchored to the SETTLE's committed height and that block's time --
+// the moment money moved -- not to the publishing pass's height.
 //
 // THE RULE THAT KEEPS IT HONEST: THE RELAY NOTIFIES, THE CHAIN DECIDES, THE
 // ANCHOR PROVES.  The chain stays the source of truth for ordering, time and
@@ -64,6 +74,10 @@ const (
 	StatePulseSchema = "arena.statepulse.v1"
 	// ParamsSchema is the content schema of a kind-1448 params event.
 	ParamsSchema = "arena.params.v1"
+	// RefundSchema is the content schema of a kind-1443 refund receipt.
+	RefundSchema = "arena.refund.v1"
+	// SettleSchema is the content schema of a kind-1444 settle receipt.
+	SettleSchema = "arena.settle.v1"
 	// DerivedFromCommittedState states the determinism claim ON THE WIRE: the
 	// outcome is a pure function of committed state, not a validator opinion.
 	DerivedFromCommittedState = "committed_state"
@@ -95,25 +109,34 @@ const (
 // Named refusals.  A client ignores an unanchored verdict; naming the refusal
 // lets a test assert exactly which rule fired.
 var (
-	ErrVerdictKind            = errors.New("not_a_verdict_event")
-	ErrVerdictBadSchema       = errors.New("bad_verdict_schema")
-	ErrVerdictUnanchored      = errors.New("unanchored_verdict")
-	ErrVerdictBadSignature    = errors.New("bad_verdict_signature")
-	ErrVerdictNotInRoster     = errors.New("verdict_not_in_roster")
-	ErrCommitmentKind         = errors.New("not_a_state_commitment")
-	ErrCommitmentBadSchema    = errors.New("bad_state_commitment_schema")
-	ErrCommitmentBadSignature = errors.New("bad_state_commitment_signature")
-	ErrCommitmentUnanchored   = errors.New("unanchored_state_commitment")
-	ErrPulseKind              = errors.New("not_a_state_pulse")
-	ErrPulseBadSchema         = errors.New("bad_state_pulse_schema")
-	ErrPulseBadSignature      = errors.New("bad_state_pulse_signature")
-	ErrPulseUnanchored        = errors.New("unanchored_state_pulse")
-	ErrPulseNotInRoster       = errors.New("state_pulse_not_in_roster")
-	ErrParamsKind             = errors.New("not_a_params_event")
-	ErrParamsBadSchema        = errors.New("bad_params_schema")
-	ErrParamsBadSignature     = errors.New("bad_params_signature")
-	ErrParamsUnanchored       = errors.New("unanchored_params_event")
-	ErrParamsNotInRoster      = errors.New("params_not_in_roster")
+	ErrVerdictKind                  = errors.New("not_a_verdict_event")
+	ErrVerdictBadSchema             = errors.New("bad_verdict_schema")
+	ErrVerdictUnanchored            = errors.New("unanchored_verdict")
+	ErrVerdictBadSignature          = errors.New("bad_verdict_signature")
+	ErrVerdictNotInRoster           = errors.New("verdict_not_in_roster")
+	ErrCommitmentKind               = errors.New("not_a_state_commitment")
+	ErrCommitmentBadSchema          = errors.New("bad_state_commitment_schema")
+	ErrCommitmentBadSignature       = errors.New("bad_state_commitment_signature")
+	ErrCommitmentUnanchored         = errors.New("unanchored_state_commitment")
+	ErrPulseKind                    = errors.New("not_a_state_pulse")
+	ErrPulseBadSchema               = errors.New("bad_state_pulse_schema")
+	ErrPulseBadSignature            = errors.New("bad_state_pulse_signature")
+	ErrPulseUnanchored              = errors.New("unanchored_state_pulse")
+	ErrPulseNotInRoster             = errors.New("state_pulse_not_in_roster")
+	ErrParamsKind                   = errors.New("not_a_params_event")
+	ErrParamsBadSchema              = errors.New("bad_params_schema")
+	ErrParamsBadSignature           = errors.New("bad_params_signature")
+	ErrParamsUnanchored             = errors.New("unanchored_params_event")
+	ErrParamsNotInRoster            = errors.New("params_not_in_roster")
+	ErrReceiptKind                  = errors.New("not_a_receipt_event")
+	ErrReceiptBadSchema             = errors.New("bad_receipt_schema")
+	ErrReceiptBadSignature          = errors.New("bad_receipt_signature")
+	ErrReceiptUnanchored            = errors.New("unanchored_receipt")
+	ErrReceiptNotInRoster           = errors.New("receipt_not_in_roster")
+	ErrReceiptBadOutcome            = errors.New("bad_receipt_outcome")
+	ErrReceiptNoOutputs             = errors.New("receipt_has_no_outputs")
+	ErrReceiptBadOutput             = errors.New("bad_receipt_output")
+	ErrReceiptParamsVersionMismatch = errors.New("receipt_params_version_mismatch")
 )
 
 // ValidatorKey is one roster entry: a validator's Nostr pubkey, its moniker and
@@ -186,6 +209,53 @@ type VerdictContent struct {
 	Height            int64   `json:"height"`
 	BlockHash         string  `json:"block_hash"`
 	DerivedFrom       string  `json:"derived_from"`
+}
+
+// ReceiptOut is one committed destination's ecash in a receipt: the proof the
+// mint signed, plus the recipient key its P2PK lock names.  dleq has NO
+// omitempty: the key must always be present on the wire, null when the mint
+// gave none.  Routing the field through Proof would drop it, because Proof.DLEQ
+// carries omitempty.
+type ReceiptOut struct {
+	Recipient string `json:"recipient"`
+	Amount    int64  `json:"amount"`
+	ID        string `json:"id"`
+	Secret    string `json:"secret"`
+	C         string `json:"C"`
+	DLEQ      *DLEQ  `json:"dleq"` // null when the mint gave none
+}
+
+// ReceiptContent is the exact content JSON of a kind-1443 refund / kind-1444
+// settle receipt: the MONEY FACT a validator publishes once an escrow has
+// actually moved.  A verdict CLAIMS an outcome; a receipt CARRIES the minted
+// outputs the claim implies, so a relay-only client can claim them without any
+// HTTP path back to a validator (handover §3).
+//
+// height/settled_at are the SETTLE's committed height and that block's TIME,
+// not the publishing pass's: they say WHEN the money moved, which is what makes
+// a receipt a fact rather than a heartbeat.
+type ReceiptContent struct {
+	Schema        string       `json:"schema"`
+	AuctionID     string       `json:"auction_id"`
+	BidID         string       `json:"bid_id"`
+	Outcome       string       `json:"outcome"` // refund | settle
+	Height        int64        `json:"height"`
+	BlockHash     string       `json:"block_hash"`
+	SettledAt     int64        `json:"settled_at"`
+	ParamsVersion string       `json:"params_version"`
+	Out           []ReceiptOut `json:"out"`
+}
+
+// CheckParamsVersion refuses when the receipt's params_version differs from the
+// digest of the terms the caller trusts: a payout is money under the TERMS in
+// force, and a client must not accept one computed under other terms (handover
+// §6).  It is the comparison between the terms the app trusts and the receipt
+// it holds, and it must be testable.
+func (c *ReceiptContent) CheckParamsVersion(p Params) error {
+	if c.ParamsVersion != paramsVersion(p) {
+		return ErrReceiptParamsVersionMismatch
+	}
+	return nil
 }
 
 // StateCommitmentContent is the exact content JSON of a kind-1447 state commit.
@@ -550,6 +620,143 @@ func ParseParamsEvent(ev *Event, roster map[string]ValidatorKey) (*ParamsContent
 	if roster != nil {
 		if _, ok := roster[ev.Pubkey]; !ok {
 			return nil, fmt.Errorf("%w: %s", ErrParamsNotInRoster, ev.Pubkey)
+		}
+	}
+	return &c, nil
+}
+
+// receiptOutputs pairs each committed proof with the recipient key its P2PK
+// lock names, via parseP2PK(secret).Data VERBATIM -- the same compressed form
+// bid.Wallet carries, so a client can compare the two directly.  Only a plain
+// P2PK is accepted: verifySettle's recipientMatches already refused any other
+// shape at admission, so a failure here is defensive, not reachable on
+// committed state.
+func receiptOutputs(proofs []Proof) ([]ReceiptOut, error) {
+	out := make([]ReceiptOut, len(proofs))
+	for i, p := range proofs {
+		l, err := parseP2PK(p.Secret)
+		if err != nil || l.Locktime != 0 || len(l.Refund) != 0 || l.NSigs != 1 || len(l.Pubkeys) != 0 {
+			return nil, fmt.Errorf("%w: output %d is not a plain P2PK", ErrReceiptBadOutput, i)
+		}
+		out[i] = ReceiptOut{Recipient: l.Data, Amount: p.Amount, ID: p.ID, Secret: p.Secret, C: p.C, DLEQ: p.DLEQ}
+	}
+	return out, nil
+}
+
+// BuildRefundEvent builds a signed kind-1443 refund receipt (schema
+// arena.refund.v1, outcome refund).  The anchor is MANDATORY: the committed
+// height the settle landed at, that block's hash and its TIME.  A non-positive
+// height, an empty block hash or a non-positive settled_at refuses as
+// ErrReceiptUnanchored, so an unanchored receipt cannot be built at all.  The
+// event is signed under sk -- the validator's OWN key, never a shared publisher
+// key, exactly like a verdict.
+func BuildRefundEvent(sk *btcec.PrivateKey, rc ReceiptContent, at int64) (*Event, error) {
+	return buildReceiptEvent(sk, rc, KindRefund, RefundSchema, "refund", at)
+}
+
+// BuildSettleEvent builds a signed kind-1444 settle receipt (schema
+// arena.settle.v1, outcome settle).
+func BuildSettleEvent(sk *btcec.PrivateKey, rc ReceiptContent, at int64) (*Event, error) {
+	return buildReceiptEvent(sk, rc, KindSettle, SettleSchema, "settle", at)
+}
+
+// buildReceiptEvent is the one builder both receipt kinds share: the
+// kind/schema/outcome triple is fixed by the caller, so a receipt can never be
+// built with the other kind's schema or the other outcome's value.
+func buildReceiptEvent(sk *btcec.PrivateKey, rc ReceiptContent, kind int, schema, outcome string, at int64) (*Event, error) {
+	if rc.Height <= 0 || rc.BlockHash == "" || rc.SettledAt <= 0 {
+		return nil, ErrReceiptUnanchored
+	}
+	if rc.AuctionID == "" || rc.BidID == "" {
+		return nil, fmt.Errorf("%w: receipt needs an auction id and a bid id", ErrReceiptBadSchema)
+	}
+	if rc.Outcome != outcome {
+		return nil, fmt.Errorf("%w: %q on a %s receipt", ErrReceiptBadOutcome, rc.Outcome, outcome)
+	}
+	if len(rc.Out) == 0 {
+		return nil, ErrReceiptNoOutputs
+	}
+	if rc.ParamsVersion == "" {
+		return nil, ErrReceiptParamsVersionMismatch
+	}
+	rc.Schema = schema
+	body, err := json.Marshal(rc)
+	if err != nil {
+		return nil, err
+	}
+	// auction/bid/height/hash are the tags §3 fixes as what the app relies on;
+	// outcome and p are the same two additions a verdict carries, and p is what
+	// makes the roster check indexable.
+	tags := [][]string{
+		{"auction", rc.AuctionID},
+		{"bid", rc.BidID},
+		{"height", strconv.FormatInt(rc.Height, 10)},
+		{"hash", rc.BlockHash},
+		{"outcome", rc.Outcome},
+		{"p", NostrPubkeyHex(sk)},
+	}
+	return SignEvent(sk, kind, string(body), tags, at)
+}
+
+// ParseRefundEvent reads a kind-1443 refund receipt as a client would.
+func ParseRefundEvent(ev *Event, roster map[string]ValidatorKey) (*ReceiptContent, error) {
+	return parseReceiptEvent(ev, KindRefund, RefundSchema, "refund", roster)
+}
+
+// ParseSettleEvent reads a kind-1444 settle receipt as a client would.
+func ParseSettleEvent(ev *Event, roster map[string]ValidatorKey) (*ReceiptContent, error) {
+	return parseReceiptEvent(ev, KindSettle, SettleSchema, "settle", roster)
+}
+
+// parseReceiptEvent is the one parser both receipt kinds share: it verifies the
+// kind, the signature, the schema, the outcome-vs-kind pairing and the MANDATORY
+// anchor, cross-checking the TAGS against the content so a relay that re-framed
+// one cannot hide the other.  Each fault is refused by name.  roster, when
+// non-nil, additionally checks membership.
+func parseReceiptEvent(ev *Event, kind int, schema, outcome string, roster map[string]ValidatorKey) (*ReceiptContent, error) {
+	if ev == nil || ev.Kind != kind {
+		return nil, ErrReceiptKind
+	}
+	if err := ev.Verify(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrReceiptBadSignature, err)
+	}
+	var c ReceiptContent
+	if err := json.Unmarshal([]byte(ev.Content), &c); err != nil {
+		return nil, ErrReceiptBadSchema
+	}
+	if c.Schema != schema {
+		return nil, fmt.Errorf("%w: %q", ErrReceiptBadSchema, c.Schema)
+	}
+	if c.Outcome != outcome {
+		return nil, fmt.Errorf("%w: %q on a %s receipt", ErrReceiptBadOutcome, c.Outcome, outcome)
+	}
+	if c.AuctionID == "" || c.BidID == "" {
+		return nil, fmt.Errorf("%w: receipt needs an auction id and a bid id", ErrReceiptBadSchema)
+	}
+	// The anchor is read from the TAGS (indexable) and cross-checked against the
+	// content, so a relay that re-framed one cannot hide the other.
+	tagAuction, okA := tagValue(ev.Tags, "auction")
+	tagBid, okB := tagValue(ev.Tags, "bid")
+	tagHeight, okH := tagValue(ev.Tags, "height")
+	tagHash, okHash := tagValue(ev.Tags, "hash")
+	if !okA || !okB || !okH || !okHash {
+		return nil, ErrReceiptUnanchored
+	}
+	if tagAuction != c.AuctionID || tagBid != c.BidID {
+		return nil, fmt.Errorf("%w: tags name a different bid", ErrReceiptBadSchema)
+	}
+	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.BlockHash {
+		return nil, ErrReceiptUnanchored
+	}
+	if c.Height <= 0 || c.BlockHash == "" || c.SettledAt <= 0 {
+		return nil, ErrReceiptUnanchored
+	}
+	if len(c.Out) == 0 {
+		return nil, ErrReceiptNoOutputs
+	}
+	if roster != nil {
+		if _, ok := roster[ev.Pubkey]; !ok {
+			return nil, fmt.Errorf("%w: %s", ErrReceiptNotInRoster, ev.Pubkey)
 		}
 	}
 	return &c, nil

@@ -15,7 +15,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -381,6 +383,40 @@ func TestParamsEventCarriesEveryTermAndTheAnchor(t *testing.T) {
 	}
 	if _, err := ParseParamsEvent(off, roster); err == nil || !strings.Contains(err.Error(), ErrParamsNotInRoster.Error()) {
 		t.Fatalf("off-roster params must refuse as %v, got %v", ErrParamsNotInRoster, err)
+	}
+}
+
+// A4 pin 2: the anti-snipe extension is uncapped and a client CANNOT infer a cap
+// from the wire.  The behavioural proof that the app keeps extending without a
+// cap is TestAntiSnipeResetsWithNoCap (settle_test.go:91, 20 extensions); this is
+// the wire half.  A client reads the terms from the relay alone, so no params
+// content key may name an extension cap: MaxTotalExtension exists nowhere in the
+// code (only a comment at node.go:200), and a key like max_total_extension would
+// hand a client a cap the app does not enforce.
+func TestParamsWireNamesNoExtensionCap(t *testing.T) {
+	sk := testVerifierKey(t)
+	p := Params{
+		MintURL: "http://127.0.0.1:3338", KeysetID: "0102b930f4dc2d6a",
+		Keys:         map[string]string{"1": "02aa", "2": "02bb", "64": "02cc"},
+		GroupKey:     "03be47f12cc26f63cedb617ecc5dae10485aab91a63bd7ba808ae7c4f23e853da4",
+		MinWindowSec: 60, MaxWindowSec: 900,
+		SettlementSafetySec: 900, BidToConsensusLatencySec: 15,
+		MinDurationSec: 20, MaxDurationSec: 100000, MaxProofs: 64, Threshold: 3,
+		Validators: []ValidatorKey{{Pubkey: NostrPubkeyHex(sk), Name: "v1", Index: 1}},
+	}
+	ev, err := BuildParamsEvent(sk, p, 77, strings.Repeat("cd", 32), tNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(ev.Content), &raw); err != nil {
+		t.Fatal(err)
+	}
+	capKey := regexp.MustCompile(`(?i)extension|max_total|max_extension|cap`)
+	for k := range raw {
+		if capKey.MatchString(k) {
+			t.Fatalf("params content names an extension cap (%q): the app reads the terms from the relay alone and must never be able to derive a cap", k)
+		}
 	}
 }
 

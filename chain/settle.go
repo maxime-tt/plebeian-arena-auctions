@@ -257,6 +257,11 @@ func (s *State) recipientMatches(secret, key string) bool {
 func (s *State) applySettle(st *settleTx, v *settleCheck) {
 	bid := s.Bids[st.Bid]
 	bid.Settled, bid.Out = st.Outcome, st.Proofs
+	// A1b: record WHICH block moved the money.  FinalizeBlock sets
+	// s.Height, s.Time = req.Height, req.Time.Unix() before it applies any tx, so
+	// this is the block being finalized: deterministic, and identical on every
+	// validator.
+	bid.SettledHeight, bid.SettledAt = s.Height, s.Time
 	for _, y := range v.ys {
 		s.UsedY[y] = bid.ID
 	}

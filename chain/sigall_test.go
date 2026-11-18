@@ -162,6 +162,47 @@ func TestSigAllLocktimeFloorUsesEstablishedEnd(t *testing.T) {
 	}
 }
 
+// A4 pin 1: the locktime floor is the BLOCK time, not the bidder's clock.  An
+// anti-snipe bid that locks off its own clock -- a clock gap behind the block's
+// -- under-locks by exactly that gap, and the chain refuses it by name.  This is
+// the chain-side twin of the client defect fixed in web/src/lib/arena.js
+// (minBidLocktime): a client that derives the locktime from its own clock
+// produces a bid the chain MUST refuse, so the proof lives here.
+func TestSigAllLocktimeFloorIsBlockTimeNotBidderClock(t *testing.T) {
+	a, m, id := liveApp(t)
+	au := a.st.Auctions[id]
+	const window = 300
+	au.Mode, au.WindowSec = "antisnipe", window
+	T := tNow + 50 // the block's time; the bidder's clock is 60 s behind it
+	au.EndAt = T + 10
+	want := T + window + a.st.Params.SettlementSafetySec + a.st.Params.BidToConsensusLatencySec
+	if got := a.st.minLocktime(au, T); got != want {
+		t.Fatalf("minLocktime at block time %d = %d, want %d (now + WindowSec + safety + latency)", T, got, want)
+	}
+
+	// A bid whose escrow locktime was derived from the bidder's earlier clock:
+	// (T - skew) + W + safety + latency, i.e. below the block-time floor by skew.
+	const skew = 60
+	earlyLock := (T - skew) + window + a.st.Params.SettlementSafetySec + a.st.Params.BidToConsensusLatencySec
+	alice := newBidder(t)
+	var proofs []Proof
+	left, i := int64(150), 0
+	for d := int64(128); d >= 1; d /= 2 {
+		for left >= d {
+			proofs = append(proofs, m.sign(t, d, lockForSigAll(a.st.Params.GroupKey, alice.wallet, earlyLock, hex.EncodeToString(append(make([]byte, 30), byte(i), byte(i))))))
+			left -= d
+			i++
+		}
+	}
+	c, _ := json.Marshal(BidContent{Auction: id, Amount: 150, Wallet: alice.wallet, Name: "t", Proofs: proofs,
+		OutcomeTemplates: m.templates(t, alice, au.SellerWallet, proofs)})
+	ev := signEventTags(t, alice.sk, KindBid, string(c), T, [][]string{{"e", au.RootID}})
+	err := a.st.applyBid(ev, T, 11, true, true)
+	if err == nil || !strings.Contains(err.Error(), "locktime below the floor for this lot") {
+		t.Fatalf("a bid locked off the bidder's earlier clock was not refused by name: %v", err)
+	}
+}
+
 // And the parser refuses such an extending bid by name.
 func TestSigAllExtendingBidUnderNewFloorRefused(t *testing.T) {
 	a, m, id := liveApp(t)
