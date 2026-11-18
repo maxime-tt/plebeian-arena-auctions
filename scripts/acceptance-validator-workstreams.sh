@@ -91,6 +91,10 @@ echo "== B and C probes =="
 node "$REPO/tests/probe-restart-ingest.mjs" "http://127.0.0.1:$PORT" 2>&1 | tee "$LOGDIR/probe-bc.log"
 
 echo
+echo "== the instant refund while the lot is still open (handover-2026-11-18 §4.1) =="
+node "$REPO/tests/probe-instant-refund.mjs" "http://127.0.0.1:$PORT" 2>&1 | tee "$LOGDIR/probe-refund.log"
+
+echo
 echo "== acceptance suite (its bid-commit waits are the C gate) =="
 # Run the copy in THIS worktree: the suite imports ../web/src/lib/arena.js, so
 # running the canonical clone's copy would exercise the canonical clone's client
