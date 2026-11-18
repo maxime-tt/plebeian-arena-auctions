@@ -99,6 +99,14 @@ type Auction struct {
 	V4VSplit []CommittedSplitRow `json:"v4vSplit,omitempty"`
 }
 
+// OriginalEnd is the end time the CREATE implies: CreatedAt + DurationSec.
+// Neither field ever moves -- applyCreate sets EndAt = now + c.DurationSec and
+// CreatedAt = now, and a supersession never recomputes either -- so this is the
+// lot's end as committed, whatever later anti-snipe bids did to EndAt.  A
+// kind-1449 lot event carries it beside the CURRENT end so a reader can tell an
+// extension from the original schedule.
+func (au *Auction) OriginalEnd() int64 { return au.CreatedAt + au.DurationSec }
+
 type Bid struct {
 	ID       string  `json:"id"`
 	Auction  string  `json:"auction"`
@@ -129,6 +137,17 @@ type Bid struct {
 	// zero on every bid that has not settled, so an old snapshot loads as-is.
 	SettledHeight int64 `json:"settledHeight,omitempty"` // the committed height the settle tx landed at
 	SettledAt     int64 `json:"settledAt,omitempty"`     // that block's time (unix seconds)
+	// The per-bid lot state (kind 1449): the end THIS bid committed by
+	// extending the lot and the lot's extension count right after that move.
+	// Both are needed because a later bid moves au.EndAt again, so the current
+	// EndAt cannot say what an earlier bid established.  omitempty is
+	// MANDATORY for the same reason as the settle when above: snapshot.go's
+	// load path refuses a state whose canonical encoding does not re-encode
+	// byte-identically, so a field without it would make every existing
+	// data/app-state/*.json unreadable.  Both are zero on every bid that did
+	// not extend, so an old snapshot loads as-is.
+	EstablishedEnd   int64 `json:"establishedEnd,omitempty"`   // the end this bid committed by extending the lot
+	ExtensionOrdinal int   `json:"extensionOrdinal,omitempty"` // the lot's extension count after this bid's move (1 for the first)
 }
 
 type Rejection struct {
@@ -778,6 +797,10 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 		au.EndAt = now + au.WindowSec
 		au.Extensions++
 		bid.Extended = true
+		// The committed end and ordinal belong to THIS bid: a later bid moves
+		// au.EndAt again, so the lot's current end cannot say what this one
+		// established (kind 1449 publishes exactly this pair).
+		bid.EstablishedEnd, bid.ExtensionOrdinal = au.EndAt, au.Extensions
 	}
 	au.HighBid, au.HighAmount = ev.ID, b.Amount
 	au.Bids = append(au.Bids, ev.ID)

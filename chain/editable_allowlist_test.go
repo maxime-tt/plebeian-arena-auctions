@@ -52,6 +52,7 @@ func TestKindMapIsRegularRange(t *testing.T) {
 		"create": KindCreate, "bid": KindBid, "chat": KindChat, "refund": KindRefund,
 		"settle": KindSettle, "outcome": KindOutcome, "funding_abort": KindFundingAbort,
 		"state_commit": KindStateCommit, "params": KindParams,
+		"lot": KindLot, "refused": KindRefused,
 	}
 	for role, k := range want {
 		if AuctionKinds[role] != k {
@@ -82,7 +83,7 @@ func TestKindMapIsRegularRange(t *testing.T) {
 		}
 	}
 	// the series must line up with the spec's exact numbering
-	for role, k := range map[string]int{"create": 1440, "bid": 1441, "chat": 1442, "refund": 1443, "settle": 1444, "outcome": 1445, "funding_abort": 1446, "state_commit": 1447, "params": 1448} {
+	for role, k := range map[string]int{"create": 1440, "bid": 1441, "chat": 1442, "refund": 1443, "settle": 1444, "outcome": 1445, "funding_abort": 1446, "state_commit": 1447, "params": 1448, "lot": 1449, "refused": 1450} {
 		if AuctionKinds[role] != k {
 			t.Errorf("role %q must be %d, got %d", role, k, AuctionKinds[role])
 		}
@@ -96,12 +97,13 @@ func TestKindMapIsRegularRange(t *testing.T) {
 // kind literals and are allowed.
 func TestNoScatteredKindLiterals(t *testing.T) {
 	old := regexp.MustCompile(`\b28(6[3-9]\d|6[5-9]\d)\b`) // the POC's 2864x ephemeral range
-	// a bare 144x used AS A NUMBER (not preceded by a quote, not part of a
+	// a bare 144x/145x used AS A NUMBER (not preceded by a quote, not part of a
 	// coordinate string like "1440:" and not in a kind: json field).  The class
-	// is 144[0-9], so the params kind (1448) is covered alongside the rest.
-	bare := regexp.MustCompile(`(^|[^\w"'])(144[0-9])([^\w":]|$)`)
-	// the ephemeral pulse is a five-digit number the 144x class cannot see, so
-	// it gets its own literal check (same exemptions: quotes, coordinates,
+	// is 14(4[0-9]|5[0-9]), so the params kind (1448), the lot (1449) and the
+	// refusal (1450) are covered alongside the rest.
+	bare := regexp.MustCompile(`(^|[^\w"'])(14(4[0-9]|5[0-9]))([^\w":]|$)`)
+	// the ephemeral pulse is a five-digit number the 144x/145x class cannot see,
+	// so it gets its own literal check (same exemptions: quotes, coordinates,
 	// comments and any line that already names a Kind constant).
 	pulse := regexp.MustCompile(`(^|[^\w"'])(21447)([^\w":]|$)`)
 	root := "."
