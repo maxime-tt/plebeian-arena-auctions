@@ -231,11 +231,17 @@ ever want a one-off backfill.
 
 **Side effect of the live proof, stated plainly:** proving "the relay shows the new kinds" on the live
 root required a real money move, so the probe created two lots there — `instant-refund-…` and
-`instant-settle-…`. The settle lot is closed and its seller was paid (the 1444 above). The refund lot
-is still `open` with a leading bid of 110 sats, which is bob's escrow; the chain blocks on demand but
-still advances when idle (measured: one block per 30–90 s), so it closes at the first block after its
-end and the settler then moves that escrow. Both are ordinary lots in the live state; nothing is
-stranded by this increment.
+`instant-settle-…`. Both are now **closed and settled**, and the second one closed on its own exactly
+as this section predicted: its `endAt` was 1794997766 and it closed at height 1294 the same second,
+with its winning bid settled at height 1296 and four kind-1444 receipts on the relay for it — a third
+independent live pass over the whole path, after the refund and the first settle.
+
+**What that does strand, and it is not the chain's fault:** the probe mints a fresh identity per run
+and discards the keys at exit, so the ecash those receipts describe is P2PK-locked to keys nobody
+holds — 110 sats of fake-sat stablecoin the dev mint will not see spent again. The chain moved every
+escrow to its committed destination, which is exactly what it promises; the receiving keys are gone
+because the probe threw them away. If a stray test lot on the live root matters, that is the argument
+for running this probe against a demo root only, as the earlier acceptance runs did.
 
 ## 6. What I could not do
 
