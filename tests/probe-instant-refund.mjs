@@ -1,6 +1,6 @@
 // Live probe for HANDOVER-2026-11-18 §4.1: measure the instant refund.
 //
-//   node tests/probe-instant-refund.mjs [http://127.0.0.1:8095]
+//   node tests/probe-instant-refund.mjs [http://127.0.0.1:8095] [ws://127.0.0.1:10547]
 //
 // A funds and bids at the start price; B outbids at a higher amount; the lot
 // stays OPEN (600 s of anti-snipe time), so a refund that lands here is an
@@ -11,12 +11,20 @@
 // The chain must already be up with -demo-controls (the suite's own flag):
 // scripts/acceptance-validator-workstreams.sh wires this probe in.
 //
-// This file asserts the MONEY facts only. The kind-1443 receipt assertion is a
-// separate increment (the chain change that publishes it is not in this tree),
-// so it is kept as one function, checkReceipt(), called once at the end.
-import { ArenaClient, newIdentity, idPub } from '../web/src/lib/arena.js';
+// Then the RECEIPTS (handover-2026-11-18 §3/§6): the same refund must have a
+// kind-1443 event on the relay, anchored to the settle's committed height and
+// carrying the minted outputs, and a second short fixed lot is closed to get the
+// kind-1444 settle receipt for the seller's payout. Both are read back from the
+// relay with nak and re-checked against /api/state and the params roster, and
+// both are printed verbatim under RAW 1443 EVENT / RAW 1444 EVENT.
+import { spawn } from 'node:child_process';
+import { ArenaClient, newIdentity, idPub, walletPub } from '../web/src/lib/arena.js';
 
 const BASE = process.argv[2] || 'http://127.0.0.1:8080';
+// The relay under test: the 4th argv slot (the acceptance script passes its
+// $RELAY), the environment, or the script's default local port.
+const RELAY = process.argv[3] || process.env.ACCEPTANCE_RELAY || 'ws://127.0.0.1:10547';
+const NAK = process.env.NAK_BINARY || `${process.env.HOME || ''}/.local/bin/nak`;
 const c = new ArenaClient(BASE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
@@ -47,14 +55,131 @@ async function placeBid(u, coord, amount) {
   return { id: r.id, locked, state: bid };
 }
 
-// The kind-1443 (refund) / 1444 (settle) receipt assertions land here in the
-// next increment. Nothing to assert in this tree yet: the publishing hook is
-// not written, so a receipt would be a false negative, not a finding.
-async function checkReceipt() { /* receipt step: separate increment */ }
+// ── the receipts (handover §3, the wire contract) ───────────────────────────
+// A receipt is read from the RELAY alone, exactly as the app would: nak prints
+// the stored events as NDJSON, one per line. Every assertion below re-checks
+// what ParseRefundEvent/ParseSettleEvent enforce on the chain side, plus the one
+// thing only the relay can prove: that out[] IS the ecash /api/state committed.
+const tagOf = (ev, name) => { const t = (ev.tags || []).find((x) => x[0] === name); return t ? t[1] : undefined; };
+
+function nakReq(kind) {
+  return new Promise((resolve, reject) => {
+    // spawn, not execFile: nak reads a filter from STDIN when it is a pipe, so
+    // an inherited open stdin makes it wait forever. stdin must be /dev/null.
+    const p = spawn(NAK, ['req', '-k', String(kind), RELAY], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '', settled = false;
+    const parse = () => {
+      const evs = [];
+      for (const line of out.split('\n')) {
+        const s = line.trim();
+        if (!s) continue;
+        try { evs.push(JSON.parse(s)); } catch { /* a nak banner line, not an event */ }
+      }
+      return evs;
+    };
+    const timer = setTimeout(() => { p.kill('SIGKILL'); }, 15000);
+    const finish = (why) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (why) reject(new Error(`nak req -k ${kind} ${why}: ${err.trim()}`));
+      else resolve(parse());
+    };
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', (e) => finish(`could not run (${e.message})`));
+    p.on('close', (code) => { if (parse().length || code === 0) finish(null); else finish(`exited ${code}`); });
+  });
+}
+
+// The newest kind-1448 params event on the relay: the terms in force (hence the
+// digest a receipt must carry) and the roster its signer must be on.
+async function relayParams() {
+  const evs = await nakReq(1448);
+  if (!evs.length) throw new Error('no kind-1448 params event on the relay');
+  evs.sort((a, b) => (b.created_at - a.created_at) || (a.id < b.id ? 1 : -1));
+  const content = JSON.parse(evs[0].content);
+  return {
+    version: String(content.params_version),
+    roster: new Set((content.validators || []).map((v) => String(v.pubkey).toLowerCase())),
+  };
+}
+
+// checkReceipt asserts one receipt kind end to end. It waits for the relay to
+// carry an event naming the bid, prints it verbatim under the RAW marker, then
+// re-checks the contract: schema/ids/outcome, the anchor (content AND tags, the
+// cross-check ParseVerdict enforces), the roster, the per-destination recipient,
+// and that out[].secret/C equal the proofs /api/state committed for that bid.
+// §3 allows several validators to publish their own receipt for one move, so
+// every event naming the bid is admitted and the earliest-anchored one -- what a
+// client keeps after the (bid_id, outcome) dedupe -- carries the deep checks.
+async function checkReceipt(kind, schema, outcome, { coord, bidId, stateBid, recipients, params }) {
+  const label = `kind ${kind} ${outcome}`;
+  let matches;
+  try {
+    matches = await until(async () => {
+      const m = (await nakReq(kind)).filter((ev) => tagOf(ev, 'bid') === bidId);
+      return m.length ? m : null;
+    }, 30000, `${label} naming the bid on ${RELAY}`);
+  } catch {
+    ok(false, `${label}: no receipt naming the bid on ${RELAY} within 30 s`);
+    return;
+  }
+  const raw = matches.map((ev) => JSON.parse(ev.content));
+  matches.sort((a, b) => (a.created_at - b.created_at) || (a.id < b.id ? -1 : 1));
+  const ev = matches[0], c = JSON.parse(ev.content);
+
+  console.log(`      RAW ${kind} EVENT ${ev.id}`);
+  console.log(JSON.stringify(ev, null, 2));
+
+  ok(matches.length >= 1, `${label}: a receipt names the bid on ${RELAY} (${matches.length} event${matches.length === 1 ? '' : 's'}, ${new Set(matches.map((m) => m.pubkey)).size} signer(s))`);
+  ok(raw.every((x) => x.auction_id === coord && x.bid_id === bidId && x.outcome === outcome),
+    `${label}: every event naming the bid agrees on auction/bid/outcome (the §3 dedupe rule)`);
+
+  ok(c.schema === schema, `${label}: content schema == "${schema}" (got ${JSON.stringify(c.schema)})`);
+  ok(c.auction_id === coord, `${label}: content auction_id == coord (${coord})`);
+  ok(c.bid_id === bidId, `${label}: content bid_id == the bid`);
+  ok(c.outcome === outcome, `${label}: content outcome == "${outcome}"`);
+  ok(c.height === stateBid.settledHeight, `${label}: content height == bids.settledHeight (${stateBid.settledHeight})`);
+  ok(/^[0-9a-fA-F]{64}$/.test(String(c.block_hash)), `${label}: block_hash is the committed 64-hex block hash`);
+  if (!/^[0-9a-f]{64}$/.test(String(c.block_hash))) {
+    // §3 writes "<64 lowercase hex>", but the chain carries the block hash
+    // verbatim from CometBFT's HexBytes.String(), which is UPPERCASE -- the same
+    // string the shipped kind-1445 verdicts carry in their "hash" tag. The
+    // substantive checks are the tag/content agreement below and that the height
+    // is the settle's; this line flags the wording mismatch, it does not fail.
+    console.log(`      INFO ${label}: block_hash is UPPERCASE hex (${c.block_hash.slice(0, 8)}…), as CometBFT's HexBytes.String() and the live 1445 verdicts report it; §3 says "64 lowercase hex" -- a doc/wire wording mismatch, reported`);
+  }
+  ok(c.settled_at === stateBid.settledAt, `${label}: content settled_at == bids.settledAt (${stateBid.settledAt})`);
+  ok(c.params_version === params.version, `${label}: params_version == the newest kind-1448 digest`);
+  ok(Array.isArray(c.out) && c.out.length > 0, `${label}: out is non-empty (${(c.out || []).length})`);
+
+  // the tag anchor must agree with the content, field for field
+  ok(tagOf(ev, 'auction') === coord, `${label}: tag auction == coord`);
+  ok(tagOf(ev, 'bid') === bidId, `${label}: tag bid == the bid`);
+  ok(tagOf(ev, 'height') === String(c.height), `${label}: tag height == strconv(height)`);
+  ok(tagOf(ev, 'hash') === c.block_hash, `${label}: tag hash == content block_hash`);
+
+  // the signer must be on the roster the params event carries
+  ok(params.roster.has(String(ev.pubkey).toLowerCase()),
+    `${label}: signer ${String(ev.pubkey).slice(0, 12)}… is on the kind-1448 roster of ${params.roster.size}`);
+  if (matches.length > 1) {
+    console.log(`      INFO ${matches.length} receipts for this bid, one per publishing validator: ${matches.map((m) => m.pubkey.slice(0, 8)).join(', ')}`);
+  }
+
+  // the money: one output per committed destination, each locked to it, and the
+  // exact proofs /api/state recorded for the bid
+  const want = recipients.map((r) => r.toLowerCase());
+  ok(c.out.every((o) => want.includes(String(o.recipient).toLowerCase())),
+    `${label}: every out[].recipient == the committed recipient (${want.map((r) => r.slice(0, 10) + '…').join(', ')})`);
+  const committed = Array.isArray(stateBid.out) ? stateBid.out : [];
+  ok(c.out.length === committed.length && c.out.every((o, i) => o.secret === committed[i].secret && o.C === committed[i].C),
+    `${label}: out[].secret/C match /api/state's bids.out entry for entry (${c.out.length})`);
+}
 
 const seller = newIdentity('Instant Refund Seller');
 const alice = newIdentity('Instant Refund Alice');
 const bob = newIdentity('Instant Refund Bob');
+const carol = newIdentity('Instant Refund Carol');
 const coordOf = (d) => `1440:${idPub(seller)}:${d}`;
 
 console.log('\n[§4.1] the instant refund: A is outbid on a lot that is still open');
@@ -133,5 +258,58 @@ ok(bid.out.length > 0, `A's refund carries a non-empty out (${bid.out.length} pr
 ok(spent.length === escrowA.length && spent.every(Boolean), `every one of A's ${escrowA.length} escrow proofs is SPENT at the mint`);
 ok(st.auctions[coord].highBid === B.id && st.bids[A.id].status === 'outbid', 'bob is still the leading bid and A is outbid: the refund did not disturb the auction');
 
-await checkReceipt();
+// --- the kind-1443 refund receipt, read off the relay ---
+console.log(`\n[§6] the refund receipt (kind 1443) on ${RELAY}`);
+await checkReceipt(1443, 'arena.refund.v1', 'refund', {
+  coord, bidId: A.id, stateBid: bid, recipients: [walletPub(alice)], params: await relayParams(),
+});
+
+// --- a second, short fixed lot: bid it, close it, read the kind-1444 settle ---
+console.log('\n[§6] the settle receipt (kind 1444): a short fixed lot, closed and paid');
+const db = 'instant-settle-' + Date.now();
+const lotB = {
+  title: 'Instant settle probe', description: 'probe', image: '', category: 'Art',
+  startPrice: 100, minIncrement: 10,
+  durationSec: 25, mode: 'fixed',
+};
+await c.createAuction(seller, lotB, db);
+const coordB = coordOf(db);
+const createdB = await attempt(until(async () => { const st = await c.state(); return st.auctions[coordB] && st; }, 15000, 'the second create to commit'), 'the second create to commit');
+if (!createdB) { await finish(); }
+ok(createdB.auctions[coordB].mode === 'fixed' && createdB.auctions[coordB].durationSec === 25,
+  `second lot open: mode=${createdB.auctions[coordB].mode} durationSec=${createdB.auctions[coordB].durationSec}`);
+
+await c.faucet(carol, 1000);
+const CB = await attempt(placeBid(carol, coordB, createdB.auctions[coordB].startPrice), "carol's bid to commit");
+if (!CB) { await finish(); }
+ok(CB.state.auctions[coordB].highBid === CB.id, `carol leads the second lot at ${CB.state.bids[CB.id].amount} sats`);
+
+// A fixed lot closes when a block lands after its end (the chain's closer does
+// it); the settle then rides the next blocks. Both are given generous time: the
+// empty-block interval can delay either.
+const endB = CB.state.auctions[coordB].endAt;
+const closedB = await attempt(until(async () => { const st = await c.state(); return st.auctions[coordB].status === 'closed' && st; }, 90000, 'the second lot to close'), 'the second lot to close');
+if (!closedB) { await finish(); }
+const tCloseB = Date.now();
+ok(closedB.auctions[coordB].winner === CB.id, 'second lot closed with carol winning at 100');
+console.log(`      INFO second lot closed ${(tCloseB / 1000 - endB).toFixed(1)} s after its end`);
+
+const settledB = await attempt(until(async () => {
+  const st = await c.state();
+  const b = st.bids[CB.id];
+  if (b && b.settled === 'settle' && b.out && b.out.length > 0) return { st, bid: b };
+  return null;
+}, 90000, 'the settle to be recorded'), 'the settle to be recorded');
+if (!settledB) { await finish(); }
+const settleMs = Date.now() - tCloseB;
+console.log(`      INFO close -> settle recorded: ${settleMs} ms (${(settleMs / 1000).toFixed(1)} s)`);
+console.log(`      INFO bids[carol].settled = settle; committed when: height ${settledB.bid.settledHeight}, at ${settledB.bid.settledAt}`);
+ok(settleMs <= 90000, `the settle was recorded within 90 s of the close (measured ${settleMs} ms)`);
+ok(settledB.bid.settledHeight > 0 && settledB.bid.settledAt > 0, `the settle carries a committed when: height ${settledB.bid.settledHeight}, at ${settledB.bid.settledAt}`);
+
+console.log(`\n[§6] the settle receipt (kind 1444) on ${RELAY}`);
+await checkReceipt(1444, 'arena.settle.v1', 'settle', {
+  coord: coordB, bidId: CB.id, stateBid: settledB.bid, recipients: [walletPub(seller)], params: await relayParams(),
+});
+
 await finish();

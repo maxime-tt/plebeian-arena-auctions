@@ -92,7 +92,7 @@ node "$REPO/tests/probe-restart-ingest.mjs" "http://127.0.0.1:$PORT" 2>&1 | tee 
 
 echo
 echo "== the instant refund while the lot is still open (handover-2026-11-18 §4.1) =="
-node "$REPO/tests/probe-instant-refund.mjs" "http://127.0.0.1:$PORT" 2>&1 | tee "$LOGDIR/probe-refund.log"
+node "$REPO/tests/probe-instant-refund.mjs" "http://127.0.0.1:$PORT" "$RELAY" 2>&1 | tee "$LOGDIR/probe-refund.log"
 
 echo
 echo "== acceptance suite (its bid-commit waits are the C gate) =="

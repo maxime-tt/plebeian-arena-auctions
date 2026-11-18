@@ -6,3 +6,5 @@ web/dist/
 node_modules
 dist-release/
 frost/target/
+chain/arenachain
+chain/arena
