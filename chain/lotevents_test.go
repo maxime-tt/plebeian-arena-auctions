@@ -14,6 +14,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	abci "github.com/cometbft/cometbft/abci/types"
 )
 
 // lotFixture is valid kind-1449 content for the build/parse tests.
@@ -617,5 +619,132 @@ func TestBidLotFieldsAreSnapshotCompatible(t *testing.T) {
 	}
 	if b := snap.state.Bids[ev.ID]; b == nil || b.EstablishedEnd != tNow+150 || b.ExtensionOrdinal != 1 {
 		t.Fatalf("restored bid = %+v, want the committed lot state", b)
+	}
+}
+
+// --- admission: a refused create must reach a block -----------------------
+
+// refusedCreate is a kind-1440 create the deterministic transition refuses: a
+// 200-character title (the handover's measured acceptance case).
+func refusedCreate(t *testing.T, a *App) (*Event, []byte) {
+	t.Helper()
+	seller := newBidder(t)
+	ev := createEv(t, seller.sk, "too-long-title", CreateContent{
+		Title: strings.Repeat("x", 200), StartPrice: 100, MinIncrement: 10,
+		DurationSec: 100, SellerWallet: seller.wallet, Mode: "fixed"}, tNow)
+	tx, _ := json.Marshal(ev)
+	return ev, tx
+}
+
+// 1. CheckTx ADMITS a create the transition refuses (Code 0, not 2): a create
+// refused in the mempool never reaches a block, so the chain could never record
+// the refusal and a relay-only client would never learn the reason.
+func TestCheckTxAdmitsARefusedCreate(t *testing.T) {
+	a, _, _ := liveApp(t)
+	_, tx := refusedCreate(t, a)
+	ck, err := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ck.Code != 0 {
+		t.Fatalf("refused create must be admitted for delivery, got code %d log %q", ck.Code, ck.Log)
+	}
+	if !strings.HasPrefix(ck.Log, "will be decided at delivery: title required (max 120 chars)") {
+		t.Fatalf("admission log = %q, want the delivery note carrying the chain's reason", ck.Log)
+	}
+}
+
+// 2. Delivered through the block path, that create is refused again and the
+// refusal is RECORDED: kind 1440, the event id, the block's height, the reason
+// verbatim; and no auction is created.
+func TestRefusedCreateIsRecordedAtDelivery(t *testing.T) {
+	a, _, _ := liveApp(t)
+	ev, tx := refusedCreate(t, a)
+	res := finalize(t, a, 11, tNow+1, tx)
+	if res.TxResults[0].Code != 2 {
+		t.Fatalf("delivery must refuse the create, got code %d", res.TxResults[0].Code)
+	}
+	var r *Rejection
+	for i := range a.st.Rejections {
+		if a.st.Rejections[i].Event == ev.ID {
+			r = &a.st.Rejections[i]
+		}
+	}
+	if r == nil {
+		t.Fatal("the refused create must be recorded in State.Rejections")
+	}
+	if r.Kind != KindCreate || r.Height != 11 || r.Reason != "title required (max 120 chars)" {
+		t.Fatalf("rejection = %+v, want the create kind at height 11 with the verbatim reason", *r)
+	}
+	if r.Pubkey != ev.Pubkey {
+		t.Fatalf("rejection pubkey = %q, want %q", r.Pubkey, ev.Pubkey)
+	}
+	if au := a.st.Auctions[coordOf(ev.Pubkey, "too-long-title")]; au != nil {
+		t.Fatalf("a refused create must leave no auction, got %+v", au)
+	}
+}
+
+// 3. The end-to-end property the admission exists for: one publisher pass over
+// that state builds and publishes a kind 1450 naming the event and the verbatim
+// reason, anchored at the rejection's height.
+func TestRefusedCreatePublishesKind1450(t *testing.T) {
+	a, _, _ := liveApp(t)
+	ev, tx := refusedCreate(t, a)
+	finalize(t, a, 11, tNow+1, tx)
+
+	rec := &recordingRelay{}
+	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 2 })
+	pub.Step(context.Background())
+
+	evs := eventsOfKind(rec, KindRefused)
+	if len(evs) != 1 {
+		t.Fatalf("refusal events = %d, want 1", len(evs))
+	}
+	c, err := ParseRefusedEvent(evs[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.EventID != ev.ID || c.Kind != KindCreate {
+		t.Fatalf("refusal names %q/%d, want %q/%d", c.EventID, c.Kind, ev.ID, KindCreate)
+	}
+	if c.Reason != "title required (max 120 chars)" {
+		t.Fatalf("reason = %q, want the chain's verbatim reason", c.Reason)
+	}
+	if c.Height != 11 || c.BlockHash != testBlockHash(11) {
+		t.Fatalf("anchor = %d/%s, want 11/%s", c.Height, c.BlockHash, testBlockHash(11))
+	}
+}
+
+// 4. The BID branch stays strict: a bid whose escrow proof comes from an
+// unpinned keyset is still refused by CheckTx with Code 2.
+func TestCheckTxStillRefusesAnUnverifiedBid(t *testing.T) {
+	a, _, coord := liveApp(t)
+	au := a.st.Auctions[coord]
+	alice := newBidder(t)
+	b, _ := json.Marshal(BidContent{Auction: au.ID, Amount: 1, Wallet: alice.wallet, Name: "t",
+		Proofs: []Proof{{ID: "unpinned-keyset", Amount: 1, Secret: "s", C: "c"}}})
+	ev := signEventTags(t, alice.sk, KindBid, string(b), tNow, [][]string{{"e", au.RootID}, {"a", au.ID}})
+	tx, _ := json.Marshal(ev)
+	ck, err := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ck.Code != 2 {
+		t.Fatalf("an unverified bid must stay refused in the mempool, got code %d log %q", ck.Code, ck.Log)
+	}
+	if !strings.Contains(ck.Log, "proof from unpinned keyset") {
+		t.Fatalf("refusal log = %q, want the escrow reason", ck.Log)
+	}
+}
+
+// 5. An undecodable tx is still refused at admission with Code 1.
+func TestCheckTxStillRejectsUndecodableTx(t *testing.T) {
+	a, _, _ := liveApp(t)
+	ck, err := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: []byte("not a nostr event")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ck.Code != 1 {
+		t.Fatalf("an undecodable tx must be refused with code 1, got %d", ck.Code)
 	}
 }

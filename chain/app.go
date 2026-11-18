@@ -852,6 +852,22 @@ func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckT
 	switch ev.Kind {
 	case KindCreate:
 		err = a.st.applyCreate(ev, a.st.Time, a.st.Height, false)
+		if err != nil {
+			// A create refused HERE never reaches a block, so FinalizeBlock's
+			// rejection path never runs, State.Rejections never gains it and a
+			// relay-only client never learns the reason (kind 1450 exists for
+			// exactly that).  So admit the tx and let delivery decide: the
+			// decision is deterministic and is made again there, where
+			// applyCreate(..., apply=true) refuses it identically, appends the
+			// Rejection with THAT block's height and the publisher anchors the
+			// kind-1450 to it.  The dry run above mutates nothing (apply=false
+			// returns before every write), so admitting costs no state change
+			// and creates are one per lot, so the block-space cost is bounded.
+			// The BID branch deliberately stays strict: applyBid verifies
+			// escrow cryptography (DLEQ, SIG_ALL), and admitting unverified
+			// bids would multiply that work across all four validators.
+			return &abci.CheckTxResponse{Code: 0, Log: "will be decided at delivery: " + err.Error()}, nil
+		}
 	case KindBid:
 		err = a.st.applyBid(ev, a.st.Time, a.st.Height, false, false)
 	}
