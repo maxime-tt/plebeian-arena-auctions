@@ -755,21 +755,46 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if err := verifySigAllBidTemplates(au, &b, s.Params); err != nil {
 		return err
 	}
-	// 2. Did it lose a race? Then it is late: recorded as void, refundable now.
-	var late error
-	min := au.StartPrice
+	// 2. Is it economically admissible? A bid's Amount is a DELTA added to the
+	// bidder's POSITION, never a resulting total (app doctrine:
+	// ui/auction/arena/bid-rules.ts:155-165; the escrow IS this delta, see the
+	// proof-sum check above). The top is the leader's position, and every other
+	// bidder's position on this lot is ZERO: their earlier legs were outbid and
+	// are refundable, so the money they still hold here is nothing (plan §2.1).
+	//
+	// That makes the floor a POSITION floor -- the resulting position
+	// own+Amount must reach top+minIncrement -- and it makes a leader's own
+	// raise legal (R2-A): with additive deltas every positive Amount strictly
+	// raises the top, so no rule needs to forbid it. The old "you are already
+	// the highest bidder" case is therefore DELETED, not relaxed.
+	//
+	// INVARIANT (asserted in tests, and the chain's form of ADR-0003 S4.9):
+	// after any accepted bid au.HighAmount == Σ { bid.Amount : bid.Status ==
+	// "leading" } and, after close, == Σ { bid.Amount : bid.Status == "won" }.
+	own := int64(0)
+	if au.HighBid != "" && s.Bids[au.HighBid].Bidder == ev.Pubkey {
+		own = au.HighAmount // the leader's position IS the top
+	}
+	min := au.StartPrice // a first bid's position must reach the opening price
 	if au.HighBid != "" {
 		min = au.HighAmount + au.MinIncrement
+		if own > 0 {
+			min = own // the leader improving their own standing need only reach the top
+		}
 	}
+	var late error
 	switch {
 	case au.Status != "open" || (timed && now >= au.EndAt):
 		late = &lateBid{"auction closed"}
 	case ev.Pubkey == au.Seller:
 		late = &lateBid{"seller cannot bid on own lot"}
-	case au.HighBid != "" && s.Bids[au.HighBid].Bidder == ev.Pubkey:
-		late = &lateBid{"you are already the highest bidder"}
-	case b.Amount < min:
-		late = &lateBid{fmt.Sprintf("bid must be at least %d sats", min)}
+	case b.Amount > math.MaxInt64-own:
+		// Byzantine guard: Amount is bounded by the proof-sum check above, but
+		// own accumulates over the leader's legs, so the SUM must not wrap.
+		return errors.New("position overflows")
+	case own+b.Amount < min:
+		late = &lateBid{fmt.Sprintf("bid must add at least %d sats: your position would reach %d, the floor is %d",
+			min-own, own+b.Amount, min)}
 	}
 	if late != nil && len(au.Voids) >= maxVoids {
 		return errors.New(late.Error() + " (late-bid limit reached for this lot)")
@@ -789,8 +814,18 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 		au.Voids = append(au.Voids, ev.ID)
 		return late
 	}
-	if au.HighBid != "" {
-		s.Bids[au.HighBid].Status = "outbid"
+	if au.HighBid != "" && s.Bids[au.HighBid].Bidder != ev.Pubkey {
+		// The lead CHANGED HANDS: the dethroned bidder's whole position is
+		// outbid -- every leg of it, because each leg's escrow is a separate
+		// delta that must be given back. A leader RAISING their own position
+		// keeps every leg leading: those legs ARE the position, and settlement
+		// walks each one (plan §2.3). This runs before the new bid is appended,
+		// so it can never touch it.
+		for _, id := range au.Bids {
+			if s.Bids[id].Status == "leading" {
+				s.Bids[id].Status = "outbid"
+			}
+		}
 	}
 	// Anti-snipe (ADR 0009): a bid with less than the window left puts the
 	// clock back to the window. No cap: the lot ends when the bidding stops.
@@ -804,7 +839,11 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 		// established (kind 1449 publishes exactly this pair).
 		bid.EstablishedEnd, bid.ExtensionOrdinal = au.EndAt, au.Extensions
 	}
-	au.HighBid, au.HighAmount = ev.ID, b.Amount
+	// HighAmount is the leader's POSITION (the sum of every leading leg), not
+	// the last delta; HighBid is the LEG that established it -- the same id
+	// closeDue promotes to Winner and DeriveVerdict names (plan §2.4). The caps
+	// and the anti-snipe extension above are unchanged by this.
+	au.HighBid, au.HighAmount = ev.ID, own+b.Amount
 	au.Bids = append(au.Bids, ev.ID)
 	return nil
 }
@@ -822,15 +861,41 @@ func (s *State) closeDue(now, height int64) {
 			au.Status, au.ClosedAt, au.ClosedH = "closed", now, height
 			if au.HighBid != "" {
 				au.Winner = au.HighBid
-				s.Bids[au.HighBid].Status = "won"
 			}
-			for _, bid := range au.Bids {
-				if bid != au.Winner {
-					s.Bids[bid].Status = "lost"
+			// Every LEADING leg is part of the winning position and is paid;
+			// every other accepted leg is refundable. Keyed on the STATUS, not
+			// the bidder (plan §2.5): a bidder's outbid legs, from a chain a
+			// later challenger defeated, are refundable and must never be
+			// promoted to won. Void bids are not in au.Bids at all.
+			//
+			// INVARIANT: HighAmount == Σ { bid.Amount : bid.Status == "won" }.
+			for _, id := range au.Bids {
+				if s.Bids[id].Status == "leading" {
+					s.Bids[id].Status = "won"
+				} else {
+					s.Bids[id].Status = "lost"
 				}
 			}
 		}
 	}
+}
+
+// positionOf returns the position a bid BELONGS TO, read from committed state:
+// the sum of its bidder's live legs, which is au.HighAmount while the bid leads
+// and the winning total after close (the §2.4 invariant).  ok is false for a
+// bid that is neither leading nor won: an outbid/lost leg's position is no
+// longer a committed fact (its money is on its way back), so nothing may be
+// stated about it -- this is the one place the guarantee is written down, and
+// the publisher (R4) keys on it.
+func (s *State) positionOf(bid *Bid) (int64, bool) {
+	if bid == nil || (bid.Status != "leading" && bid.Status != "won") {
+		return 0, false
+	}
+	au := s.Auctions[bid.Auction]
+	if au == nil || au.HighBid == "" {
+		return 0, false
+	}
+	return au.HighAmount, true
 }
 
 func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckTxResponse, error) {
@@ -867,15 +932,44 @@ func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckT
 			// and creates are one per lot, so the block-space cost is bounded.
 			// The BID branch deliberately stays strict: applyBid verifies
 			// escrow cryptography (DLEQ, SIG_ALL), and admitting unverified
-			// bids would multiply that work across all four validators.
+			// bids would multiply that work across all four validators. It
+			// also REFUSES a bid that is economically late (R3), because such
+			// a bid can never become valid -- see the comment below.
 			return &abci.CheckTxResponse{Code: 0, Log: "will be decided at delivery: " + err.Error()}, nil
 		}
 	case KindBid:
-		err = a.st.applyBid(ev, a.st.Time, a.st.Height, false, false)
-	}
-	var late *lateBid
-	if errors.As(err, &late) {
-		return &abci.CheckTxResponse{Code: 0, Log: "late: " + late.reason}, nil
+		// The BID branch leaves the cryptography where it is and decides the
+		// ECONOMY here (R3). applyBid still verifies the whole escrow (DLEQ per
+		// proof, one shared SIG_ALL lock, the bidder's two pre-signed outcome
+		// templates) before it looks at the floor, so an unverified bid is
+		// still refused outright; what changes is what happens to a bid that is
+		// verified but LATE on arrival.
+		//
+		// A bid that is late NOW can never become valid: the position floor
+		// only rises, a closed lot stays closed, and the seller never changes.
+		// So it is refused at admission and never committed -- no state entry,
+		// no void list entry, no escrow touched.  The reason goes back on the
+		// submit (`/api/tx`), NOT as a later kind-1450: a mempool refusal never
+		// reaches a block, so the chain has no committed height to anchor a
+		// refusal event to (exactly the reasoning the create branch records
+		// above).
+		//
+		// The wall clock and the lot's clock are used (as checkClose does): a
+		// lot whose end has passed cannot be won by a bid the next block will
+		// close first.  This can only make CheckTx STRICTER than delivery, never
+		// looser: minLocktime is monotone in `now`, and a block's time is never
+		// earlier than the wall clock this validator saw.
+		//
+		// `void` still exists and is still what a genuine race produces: a bid
+		// that passed this filter and was overtaken before its block (another
+		// bid took the lead and raised the floor), or a bid only a Byzantine
+		// proposer could have included.  Those are decided at delivery, where
+		// applyBid marks them void and refundable.
+		err = a.st.applyBid(ev, time.Now().Unix(), a.st.Height, false, true)
+		var late *lateBid
+		if errors.As(err, &late) {
+			return &abci.CheckTxResponse{Code: 2, Log: late.reason}, nil
+		}
 	}
 	if err != nil {
 		return &abci.CheckTxResponse{Code: 2, Log: err.Error()}, nil

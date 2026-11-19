@@ -258,6 +258,51 @@ ok(bid.out.length > 0, `A's refund carries a non-empty out (${bid.out.length} pr
 ok(spent.length === escrowA.length && spent.every(Boolean), `every one of A's ${escrowA.length} escrow proofs is SPENT at the mint`);
 ok(st.auctions[coord].highBid === B.id && st.bids[A.id].status === 'outbid', 'bob is still the leading bid and A is outbid: the refund did not disturb the auction');
 
+// ── R1-A: the WHOLE position of a leader who is outbid comes back ───────────
+// A bid's amount is a DELTA on a position, so a leader can hold SEVERAL live
+// legs at once (by raising their own position: R2-A). When a challenger takes
+// the lead, every one of those legs is outbid and refunded on its own escrow.
+console.log('\n[R1-A] a two-leg chain: the leader raises, a challenger takes the lead, BOTH legs refund');
+const d2 = 'instant-refund-two-leg-' + Date.now();
+await c.createAuction(seller, { ...lot, title: 'Two-leg refund probe', durationSec: 600 }, d2);
+const coord2 = coordOf(d2);
+const created2 = await attempt(until(async () => { const st = await c.state(); return st.auctions[coord2] && st; }, 15000, 'the two-leg create to commit'), 'the two-leg create to commit');
+if (!created2) { await finish(); }
+await c.faucet(alice, 1000);
+const L1 = await attempt(placeBid(alice, coord2, created2.auctions[coord2].startPrice), 'leg 1 to commit');
+if (!L1) { await finish(); }
+// The leader's OWN raise: the shipped client still refuses this client-side,
+// which is exactly why it needs `force` here -- the CHAIN accepts it (R2-A).
+const st2 = await c.state();
+const { locked: locked2 } = await c.lockForBid(alice, 5, st2.params, st2.auctions[coord2], { force: true, state: st2 });
+const r2 = await c.bid(alice, st2.auctions[coord2], 5, locked2);
+const L2 = await attempt(until(async () => { const st = await c.state(); return st.bids[r2.id] && st; }, 15000, 'the raise to commit'), 'the raise to commit');
+if (!L2) { await finish(); }
+ok(L2.auctions[coord2].highAmount === 105 && L2.auctions[coord2].highBid === r2.id,
+  `the leader's own raise is accepted: highAmount ${L2.auctions[coord2].highAmount} (delta 5, not 105)`);
+ok(L2.bids[L1.id].status === 'leading' && L2.bids[r2.id].status === 'leading', 'both legs of the leading chain are leading');
+const CH = await attempt(placeBid(bob, coord2, 115), 'the challenger (position 105 + the 10 increment) to commit');
+if (!CH) { await finish(); }
+const tOutbid2 = Date.now();
+ok(CH.state.bids[L1.id].status === 'outbid' && CH.state.bids[r2.id].status === 'outbid', 'the challenger outbids BOTH legs of the defeated chain');
+const both = await attempt(until(async () => {
+  const st = await c.state();
+  const a = st.bids[L1.id], b = st.bids[r2.id];
+  return (a && a.settled === 'refund' && a.out && a.out.length && b && b.settled === 'refund' && b.out && b.out.length)
+    ? { st, a, b } : null;
+}, 20000, 'both legs to be refunded'), 'both legs to be refunded');
+if (!both) { await finish(); }
+console.log(`      INFO both legs recorded settled:refund ${Date.now() - tOutbid2} ms after the outbid`);
+ok(both.st.auctions[coord2].status === 'open', 'the lot is still OPEN when both refunds are recorded');
+const spentA = await c.spent(L1.locked), spentB = await c.spent(locked2);
+ok(spentA.length === L1.locked.length && spentA.every(Boolean), `leg 1's ${spentA.length} escrow proofs are SPENT at the mint`);
+ok(spentB.length === locked2.length && spentB.every(Boolean), `leg 2's ${spentB.length} escrow proofs are SPENT at the mint`);
+for (const id of [L1.id, r2.id]) {
+  await checkReceipt(1443, 'arena.refund.v1', 'refund', {
+    coord: coord2, bidId: id, stateBid: both.st.bids[id], recipients: [walletPub(alice)], params: await relayParams(),
+  });
+}
+
 // --- the kind-1443 refund receipt, read off the relay ---
 console.log(`\n[§6] the refund receipt (kind 1443) on ${RELAY}`);
 await checkReceipt(1443, 'arena.refund.v1', 'refund', {

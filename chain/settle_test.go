@@ -227,6 +227,11 @@ func TestPushSettleRefusesForgeries(t *testing.T) {
 
 	bad["leading bid"] = mintMove(t, a, m, ev2.ID, "refund", bob.wallet, tNow+2)
 	bad["settle of an open lot"] = mintMove(t, a, m, ev2.ID, "settle", a.st.Auctions[id].SellerWallet, tNow+2)
+	// §2.6: after close only WON legs settle, so an outbid leg's committed
+	// settle template must never be honoured.
+	a.st.Auctions[id].Status, a.st.Auctions[id].Winner = "closed", ev2.ID
+	bad["settle of an outbid leg"] = mintMove(t, a, m, ev1.ID, "settle", a.st.Auctions[id].SellerWallet, tNow+2)
+	a.st.Auctions[id].Status, a.st.Auctions[id].Winner = "open", ""
 
 	for name, st := range bad {
 		if ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: makeSettle(st)}); ck.Code == 0 {

@@ -45,7 +45,6 @@ func hexCompressedGroupKey(m *testMint) string { return hex.EncodeToString(m.A.S
 
 // --- nak relay helpers ---
 
-
 // startNakRelay launches `nak serve` on a free loopback port.  The port is
 // chosen by the OS via net.Listen(":0"), so it can never collide with the
 // demo's 7770/7777/8080/3338/13338.

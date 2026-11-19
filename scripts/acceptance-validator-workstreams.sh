@@ -95,6 +95,10 @@ echo "== the instant refund while the lot is still open (handover-2026-11-18 §4
 node "$REPO/tests/probe-instant-refund.mjs" "http://127.0.0.1:$PORT" "$RELAY" 2>&1 | tee "$LOGDIR/probe-refund.log"
 
 echo
+echo "== the additive rebid chain: two-leg chain, admission fact, below-floor refusal, per-leg settle =="
+node "$REPO/tests/probe-additive-rebid.mjs" "http://127.0.0.1:$PORT" "$RELAY" 2>&1 | tee "$LOGDIR/probe-additive-rebid.log"
+
+echo
 echo "== acceptance suite (its bid-commit waits are the C gate) =="
 # Run the copy in THIS worktree: the suite imports ../web/src/lib/arena.js, so
 # running the canonical clone's copy would exercise the canonical clone's client

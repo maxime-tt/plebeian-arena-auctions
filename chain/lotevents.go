@@ -3,6 +3,15 @@ package main
 // The lot-state and refusal events: kind 1449 (the committed end of a lot) and
 // kind 1450 (the chain's own reason for dropping a client event).
 //
+// KIND 1449 CARRIES TWO SCHEMAS, told apart by the content schema string:
+// "arena.lot.v1" is the lot's committed end (and, for an extending bid, the bid
+// that moved it); "arena.bidadmit.v1" is the chain's per-bid ADMISSION fact --
+// it ACCEPTED this bid, and the position that resulted -- which is the
+// confirmation an app shows instead of guessing (R4).  Both shapes are anchored
+// at a committed height with that block's hash and both are signed under a
+// validator's OWN key, so one kind stays one anchor discipline while the schema
+// tells a reader which fact it is looking at.
+//
 // THE RECEIPT FAMILY IS THE TEMPLATE (verdict.go, "BuildRefundEvent" /
 // "parseReceiptEvent").  Both kinds here are STORED, regular kinds signed under
 // the validator's OWN key, carrying a MANDATORY anchor (height + that block's
@@ -40,6 +49,13 @@ import (
 const (
 	// LotSchema is the content schema of a kind-1449 lot event.
 	LotSchema = "arena.lot.v1"
+	// BidAdmitSchema is the content schema of a kind-1449 BID-ADMISSION event:
+	// the per-bid admission fact the chain publishes when it ACCEPTS a bid, so
+	// an app can confirm "the chain accepted this bid" from the wire instead of
+	// inferring it (R4). It rides the lot-state kind 1449 -- the one the chain
+	// already publishes about a lot's changing state -- and the schema string
+	// says which of the two shapes the event carries.
+	BidAdmitSchema = "arena.bidadmit.v1"
 	// RefusedSchema is the content schema of a kind-1450 refusal event.
 	RefusedSchema = "arena.refused.v1"
 )
@@ -60,6 +76,12 @@ var (
 	ErrRefusedNotInRoster  = errors.New("refused_not_in_roster")
 	ErrRefusedBadTarget    = errors.New("bad_refused_target_kind")
 	ErrRefusedBadEvent     = errors.New("refused_names_a_different_event")
+
+	ErrBidAdmitKind         = errors.New("not_a_bid_admit_event")
+	ErrBidAdmitBadSchema    = errors.New("bad_bid_admit_schema")
+	ErrBidAdmitBadSignature = errors.New("bad_bid_admit_signature")
+	ErrBidAdmitUnanchored   = errors.New("unanchored_bid_admit")
+	ErrBidAdmitNotInRoster  = errors.New("bid_admit_not_in_roster")
 )
 
 // LotContent is the exact content JSON of a kind-1449 lot event: the committed
@@ -191,6 +213,122 @@ func ParseLotEvent(ev *Event, roster map[string]ValidatorKey) (*LotContent, erro
 	if roster != nil {
 		if _, ok := roster[ev.Pubkey]; !ok {
 			return nil, fmt.Errorf("%w: %s", ErrLotNotInRoster, ev.Pubkey)
+		}
+	}
+	return &c, nil
+}
+
+// BidAdmitContent is the exact content JSON of a kind-1449 BID-ADMISSION event:
+// the chain's own record that it ACCEPTED one bid (R4).  An app that published
+// a bid can read this instead of guessing from silence.
+//
+// amount is THIS leg's delta -- what the leg locked, unchanged semantics.
+// position is the position the bid belongs to: the sum of every leading leg of
+// its bidder at admission, i.e. au.HighAmount while the bid leads and the
+// settlement total once the lot closes; it is the number the floor was compared
+// against.  high_bid is the leg that established that position -- the same id
+// closeDue promotes to Winner.  bidder is the leg's bidder.  height/block_hash
+// are the MANDATORY anchor: the bid's OWN committed height, not the publishing
+// pass's.
+type BidAdmitContent struct {
+	Schema    string `json:"schema"`
+	AuctionID string `json:"auction_id"`
+	BidID     string `json:"bid_id"`
+	Bidder    string `json:"bidder"`
+	Amount    int64  `json:"amount"`
+	Position  int64  `json:"position"`
+	HighBid   string `json:"high_bid"`
+	Height    int64  `json:"height"`
+	BlockHash string `json:"block_hash"`
+}
+
+// check enforces the field rules the builder and the parser share: an
+// unanchorable admission is neither buildable nor acceptable, and an admission
+// whose position is below the bid's own delta would contradict the floor the
+// chain applied.
+func (c *BidAdmitContent) check() error {
+	switch {
+	case c.AuctionID == "" || c.BidID == "" || c.Bidder == "":
+		return fmt.Errorf("%w: admission needs an auction, a bid and a bidder", ErrBidAdmitBadSchema)
+	case c.Amount <= 0:
+		return fmt.Errorf("%w: a bid's amount is a positive delta", ErrBidAdmitBadSchema)
+	case c.Position < c.Amount:
+		return fmt.Errorf("%w: position %d is below the bid's own amount %d", ErrBidAdmitBadSchema, c.Position, c.Amount)
+	case c.HighBid == "":
+		return fmt.Errorf("%w: admission needs the leading leg", ErrBidAdmitBadSchema)
+	case c.Height <= 0 || c.BlockHash == "":
+		return ErrBidAdmitUnanchored
+	}
+	return nil
+}
+
+// BuildBidAdmitEvent builds a signed kind-1449 bid-admission event.  The schema
+// is fixed here and the anchor is MANDATORY, exactly as on a lot event; it is
+// signed under sk, the validator's OWN key.
+func BuildBidAdmitEvent(sk *btcec.PrivateKey, c BidAdmitContent, at int64) (*Event, error) {
+	c.Schema = BidAdmitSchema
+	if err := c.check(); err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	// e names the admitted bid (indexable, as NIP-01 intends); auction/height/
+	// hash are the same anchor identity a lot event carries, and p is the
+	// validator identity the roster check indexes.
+	tags := [][]string{
+		{"e", c.BidID},
+		{"auction", c.AuctionID},
+		{"height", strconv.FormatInt(c.Height, 10)},
+		{"hash", c.BlockHash},
+		{"p", NostrPubkeyHex(sk)},
+	}
+	return SignEvent(sk, KindLot, string(body), tags, at)
+}
+
+// ParseBidAdmitEvent reads a kind-1449 bid-admission event as a client would:
+// it verifies the kind, the signature, the schema, the field rules and the
+// MANDATORY anchor, cross-checking the e and anchor tags against the content.
+// roster, when non-nil, additionally checks membership.  A pure lot event (or
+// any other schema) is refused by name, so a reader can tell the two shapes of
+// kind 1449 apart.
+func ParseBidAdmitEvent(ev *Event, roster map[string]ValidatorKey) (*BidAdmitContent, error) {
+	if ev == nil || ev.Kind != KindLot {
+		return nil, ErrBidAdmitKind
+	}
+	if err := ev.Verify(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBidAdmitBadSignature, err)
+	}
+	var c BidAdmitContent
+	if err := json.Unmarshal([]byte(ev.Content), &c); err != nil {
+		return nil, ErrBidAdmitBadSchema
+	}
+	if c.Schema != BidAdmitSchema {
+		return nil, fmt.Errorf("%w: %q", ErrBidAdmitBadSchema, c.Schema)
+	}
+	if err := c.check(); err != nil {
+		return nil, err
+	}
+	tagEvent, okE := tagValue(ev.Tags, "e")
+	tagAuction, okA := tagValue(ev.Tags, "auction")
+	tagHeight, okH := tagValue(ev.Tags, "height")
+	tagHash, okHash := tagValue(ev.Tags, "hash")
+	if !okE || !okA || !okH || !okHash {
+		return nil, ErrBidAdmitUnanchored
+	}
+	if tagEvent != c.BidID {
+		return nil, fmt.Errorf("%w: e tag names %s, content names %s", ErrBidAdmitBadSchema, tagEvent, c.BidID)
+	}
+	if tagAuction != c.AuctionID {
+		return nil, fmt.Errorf("%w: tags name a different lot", ErrBidAdmitBadSchema)
+	}
+	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.BlockHash {
+		return nil, ErrBidAdmitUnanchored
+	}
+	if roster != nil {
+		if _, ok := roster[ev.Pubkey]; !ok {
+			return nil, fmt.Errorf("%w: %s", ErrBidAdmitNotInRoster, ev.Pubkey)
 		}
 	}
 	return &c, nil

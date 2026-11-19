@@ -195,7 +195,7 @@ func TestSigAllLocktimeFloorIsBlockTimeNotBidderClock(t *testing.T) {
 		}
 	}
 	c, _ := json.Marshal(BidContent{Auction: id, Amount: 150, Wallet: alice.wallet, Name: "t", Proofs: proofs,
-		OutcomeTemplates: m.templates(t, alice, au.SellerWallet, proofs)})
+		OutcomeTemplates: m.templates(t, alice, au.SellerWallet, proofs, "s1")})
 	ev := signEventTags(t, alice.sk, KindBid, string(c), T, [][]string{{"e", au.RootID}})
 	err := a.st.applyBid(ev, T, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "locktime below the floor for this lot") {
@@ -222,7 +222,7 @@ func TestSigAllExtendingBidUnderNewFloorRefused(t *testing.T) {
 		}
 	}
 	c, _ := json.Marshal(BidContent{Auction: id, Amount: 150, Wallet: alice.wallet, Name: "t", Proofs: proofs,
-		OutcomeTemplates: m.templates(t, alice, au.SellerWallet, proofs)})
+		OutcomeTemplates: m.templates(t, alice, au.SellerWallet, proofs, "s1")})
 	ev := signEventTags(t, alice.sk, KindBid, string(c), tNow, [][]string{{"e", au.RootID}})
 	err := a.st.applyBid(ev, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "locktime below the floor for this lot") {

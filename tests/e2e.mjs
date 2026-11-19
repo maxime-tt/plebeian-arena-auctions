@@ -132,20 +132,25 @@ ok(true, 'settle tx recorded on chain');
 await expectReject(c.claim(alice, s.bids[b1.id], 'refund', s.params), /settled|spent/i, 'a pull release of the pushed escrow is refused');
 await expectReject(placeBid(carol, A, 115), /at least 120/, 'under-increment bid stopped by the client before locking');
 {
-  // ADR 0007: a locked bid that lost the race is recorded as void and
-  // (v0.5.0) its refund is pushed straight back
+  // R3: an economically late bid is REFUSED AT ADMISSION. The chain never
+  // commits it and never records a void, so the locked escrow is simply left
+  // locked (the bidder reclaims it after locktime; see step R). This is the
+  // block that used to prove the ADR-0007 void+instant-refund path: that path
+  // still exists, but it is only for a bid that was good when it entered the
+  // mempool and was OVERTAKEN before its block (chain/live_test.go,
+  // TestLateBidIsVoidAndRefundable).
   const st = await c.state();
   const { locked } = await c.lockForBid(carol, 115, st.params, st.auctions[A], { force: true, state: st });
-  t = Date.now();
-  const r = await c.bid(carol, st.auctions[A], 115, locked);
-  ok(r.ok && /at least 120/.test(r.late || ''), `under-increment locked bid answered at once as late -> "${r.late}"`);
-  const sv = await until(async () => { const x = await c.state(); return x.bids[r.id] && x; }, 15000, 'void bid commit');
-  ok(sv.bids[r.id].status === 'void' && !sv.auctions[A].bids.includes(r.id) && sv.auctions[A].highBid === b2.id, 'recorded on chain as void; Bob still leads');
-  const pv = await pushed(carol, r.id, "Carol's late bid", t);
-  ok(await bal(carol) === 1000, `Carol's late 115 pushed back · ${msTxt(pv)}`);
-  // the push can land before the block that records the settle tx (v0.5.1)
-  const v = await until(async () => { const x = await c.view([idPub(carol)]); return x.state.bids[r.id]?.settled && x; }, 5000, 'void settle tx').catch(() => c.view([idPub(carol)]));
-  ok(v.state.bids[r.id]?.status === 'void' && v.state.bids[r.id]?.settled === 'refund' && !(await c.view([idPub(alice)])).state.bids[r.id], "the void bid is in Carol's view only, marked settled");
+  stranded.push({ u: carol, locked });
+  await expectReject(c.bid(carol, st.auctions[A], 115, locked), /at least 120/, 'the chain REFUSES the under-increment bid at admission');
+  const sv = await c.state();
+  const carol115 = sv.auctions[A].bids.map((b) => sv.bids[b]).filter((b) => b.bidder === idPub(carol) && b.amount === 115);
+  ok(carol115.length === 0, 'no bid of Carol\'s 115 is on the chain (never committed)');
+  ok((sv.auctions[A].voids || []).length === 0, 'and the lot records no void for it');
+  ok(sv.auctions[A].highBid === b2.id && sv.bids[b2.id].status === 'leading', 'Bob still leads');
+  ok(await bal(carol) === 885, 'the refused escrow is untouched: Carol still holds 885 (115 locked until locktime)');
+  const v = await c.view([idPub(carol)]);
+  ok(!Object.values(v.state.bids).some((b) => b.amount === 115), 'the refusal left no bid, void or otherwise, in Carol\'s own view');
 }
 await expectReject((async () => { const st = await c.state(); return c.bid(seller, st.auctions[A], 500, []); })(), /proof count/, 'a bid without an escrow is refused outright');
 

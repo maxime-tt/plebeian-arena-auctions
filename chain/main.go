@@ -586,7 +586,12 @@ func broadcastTx(ctx context.Context, client *http.Client, rpcURL string, tx []b
 	}
 	out := broadcastOutcome{kind: broadcastAccepted, hash: rr.Result.Hash}
 	if strings.HasPrefix(rr.Result.Log, "late: ") {
-		// a late bid: on chain as void, refundable as soon as it lands (ADR 0007)
+		// A late bid: on chain as void, refundable as soon as it lands (ADR
+		// 0007).  Since R3 the chain REFUSES an economically late bid in
+		// CheckTx instead (code 2, handled as terminal above), so no current
+		// validator answers this way -- it is kept because a mixed-version set
+		// during the swap still can, and a client must not be told "rejected"
+		// about a bid an OLD validator really did commit as void.
 		out.late = strings.TrimPrefix(rr.Result.Log, "late: ")
 	}
 	return out

@@ -122,6 +122,7 @@ type Publisher struct {
 	published        map[string]bool // auction id -> a verdict has been published
 	receipted        map[string]bool // bidID + "|" + outcome -> a receipt has been published (or can never be)
 	lots             map[string]bool // auctionID + "|" + end_time -> a lot event has been published
+	admits           map[string]bool // bid id -> that bid's admission fact has been published (R4)
 	refusals         map[string]bool // event id + "|" + reason -> a refusal event has been published
 	lastCommitHeight int64           // committed height of the last commitment published
 	lastCommitTime   int64           // unix seconds (p.now) of the last commitment published
@@ -166,6 +167,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		published: map[string]bool{},
 		receipted: map[string]bool{},
 		lots:      map[string]bool{},
+		admits:    map[string]bool{},
 		refusals:  map[string]bool{},
 	}, nil
 }
@@ -492,23 +494,27 @@ func (p *Publisher) publishReceipts(ctx context.Context, state *State, height in
 	return any
 }
 
-// publishLots publishes the lot's COMMITTED END (kind 1449): once for every bid
-// that actually extended the lot, anchored at THAT bid's committed height and
-// that block's hash, and once for every closed lot, anchored at ClosedH.
+// publishLots publishes the lot's state (kind 1449) in three shapes: once for
+// every bid that actually extended the lot, anchored at THAT bid's committed
+// height and that block's hash; once for every ADMITTED bid that still leads or
+// won, carrying the resulting position (the arena.bidadmit.v1 shape, R4); and
+// once for every closed lot, anchored at ClosedH.
 //
-// The two shapes answer two different questions.  A bid event says "this bid
+// The three shapes answer three different questions.  A bid event says "this bid
 // moved the end to E at height H"; the per-bid pair is read from the bid
 // (EstablishedEnd/ExtensionOrdinal) because a later bid moves au.EndAt again --
 // the lot's CURRENT end cannot say what an earlier bid established.  A closed
 // lot event says "this is where the lot ended", so a late reader learns the
 // final end; a lot that never extended therefore publishes exactly one event at
-// close, with end_time == original_end_time and extensions == 0.
+// close, with end_time == original_end_time and extensions == 0.  An admission
+// event says "the chain accepted this bid, and its position is P", which is what
+// lets a client confirm its own bid from the wire.
 //
-// Dedupe is per validator by (auction_id, end_time), and an event is marked
-// only AFTER a successful relay publish, so a transient relay failure retries.
-// If the anchor block's hash is not readable yet, nothing is published: the
-// refusal is recorded and retried next pass -- a claim the chain cannot anchor
-// is not published.
+// Dedupe is per validator by (auction_id, end_time) for lot events and by bid id
+// for admission events, and an event is marked only AFTER a successful relay
+// publish, so a transient relay failure retries.  If the anchor block's hash is
+// not readable yet, nothing is published: the refusal is recorded and retried
+// next pass -- a claim the chain cannot anchor is not published.
 func (p *Publisher) publishLots(ctx context.Context, state *State, height int64) bool {
 	bidIDs := make([]string, 0, len(state.Bids))
 	for id := range state.Bids {
@@ -571,7 +577,65 @@ func (p *Publisher) publishLots(ctx context.Context, state *State, height int64)
 		any = true
 	}
 
-	// 2. Every closed lot: its FINAL end, anchored at the block that closed it.
+	// 2. Every ADMITTED bid: the chain's own confirmation that it ACCEPTED the
+	// bid, carrying the position that resulted (R4) -- so an app that published
+	// a bid reads an acceptance instead of inferring one from state.  Only a
+	// bid that still leads or won can carry its position truthfully (an
+	// outbid/lost leg's position is not a committed fact any more; see
+	// State.positionOf), so those are the shapes published.  The anchor is the
+	// BID's OWN committed height, and dedupe is per bid, so a bid is announced
+	// once.  A transient relay failure does not mark, so it retries.
+	for _, id := range bidIDs {
+		bid := state.Bids[id]
+		if bid == nil {
+			continue
+		}
+		position, ok := state.positionOf(bid)
+		if !ok {
+			continue
+		}
+		au := state.Auctions[bid.Auction]
+		if au == nil {
+			continue // no committed lot to name: not publishable, not retryable
+		}
+		p.mu.Lock()
+		done := p.admits[bid.ID]
+		p.mu.Unlock()
+		if done {
+			continue
+		}
+		blockHash, ok := p.blockHash(bid.Height)
+		if !ok || blockHash == "" {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: bid.Height,
+				AuctionID: bid.Auction, Reason: "committed_block_hash_unknown"})
+			continue
+		}
+		ac := BidAdmitContent{
+			AuctionID: bid.Auction, BidID: bid.ID, Bidder: bid.Bidder, Amount: bid.Amount,
+			Position: position, HighBid: au.HighBid, Height: bid.Height, BlockHash: blockHash,
+		}
+		ev, err := BuildBidAdmitEvent(p.key, ac, p.now())
+		if err != nil {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: bid.Height,
+				AuctionID: bid.Auction, Reason: err.Error()})
+			continue
+		}
+		rec := PublishRecord{Op: "bid_admit", CommittedHeight: height, Height: bid.Height,
+			Hash: blockHash, AuctionID: bid.Auction}
+		if err := p.relay.Publish(ctx, ev); err != nil {
+			// Do NOT mark it published: a transient relay failure retries.
+			rec.Error = err.Error()
+			p.record(rec)
+			continue
+		}
+		p.mu.Lock()
+		p.admits[bid.ID] = true
+		p.mu.Unlock()
+		p.record(rec)
+		any = true
+	}
+
+	// 3. Every closed lot: its FINAL end, anchored at the block that closed it.
 	auctionIDs := make([]string, 0, len(state.Auctions))
 	for id := range state.Auctions {
 		auctionIDs = append(auctionIDs, id)

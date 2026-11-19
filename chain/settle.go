@@ -72,7 +72,8 @@ func makeSettle(st *settleTx) []byte {
 // must follow it.
 //
 //	refund  allowed once the bid is outbid, lost or void;
-//	settle  allowed once the lot is closed and this bid won.
+//	settle  allowed once the lot is closed and THIS leg won -- every leg of the
+//	        winning position (plan §2.6), not only the leg au.Winner names.
 func (s *State) outcomeDue(bid *Bid, outcome string, now int64, signing bool) (string, error) {
 	if bid.Settled != "" {
 		return "", errors.New("escrow already settled")
@@ -88,8 +89,14 @@ func (s *State) outcomeDue(bid *Bid, outcome string, now int64, signing bool) (s
 		}
 		return bid.Wallet, nil
 	case "settle":
-		if au.Status != "closed" || au.Winner != bid.ID {
-			return "", errors.New("only the winning bid of a closed auction pays out")
+		// Every leg of the winning position pays, not just the last one: a
+		// winner's position is the sum of their leading legs, and each leg's
+		// escrow is a separate SIG_ALL swap into ITS OWN committed template
+		// (plan §2.6, §3.1). closeDue promotes exactly those legs to "won", so
+		// the status IS the membership test -- au.Winner names only the leg
+		// that set the top, and gating on it would strand the others.
+		if au.Status != "closed" || bid.Status != "won" {
+			return "", errors.New("only a winning leg of a closed auction pays out")
 		}
 		return au.SellerWallet, nil
 	}

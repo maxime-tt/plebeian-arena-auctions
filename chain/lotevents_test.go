@@ -356,6 +356,20 @@ func TestRefusedEventRefusals(t *testing.T) {
 
 // --- the publisher --------------------------------------------------------
 
+// lotShapeEvents returns the kind-1449 events that carry the arena.lot.v1
+// shape, so a test counts LOT events without counting the bid-ADMISSION facts
+// that ride the same kind (R4).
+func lotShapeEvents(t *testing.T, rec eventRecorder) []*Event {
+	t.Helper()
+	var out []*Event
+	for _, ev := range eventsOfKind(rec, KindLot) {
+		if _, err := ParseLotEvent(ev, nil); err == nil {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
 // extendingLot commits an antisnipe bid at height 12 that extends the lot past
 // its original end (tNow+100).  The bid's build-time clock matches the block's
 // so the escrow locktime clears: commit the clock at 11 first.
@@ -389,7 +403,7 @@ func TestLotEventForAnExtendingBid(t *testing.T) {
 	ctx := context.Background()
 	pub.Step(ctx)
 
-	evs := eventsOfKind(rec, KindLot)
+	evs := lotShapeEvents(t, rec)
 	if len(evs) != 1 {
 		t.Fatalf("lot events = %d, want 1", len(evs))
 	}
@@ -412,7 +426,7 @@ func TestLotEventForAnExtendingBid(t *testing.T) {
 
 	// A second pass publishes nothing new: dedupe by (auction_id, end_time).
 	pub.Step(ctx)
-	if got := len(eventsOfKind(rec, KindLot)); got != 1 {
+	if got := len(lotShapeEvents(t, rec)); got != 1 {
 		t.Fatalf("lot events after two passes = %d, want 1", got)
 	}
 	if got := countRecords(pub, "lot"); got != 1 {
@@ -437,7 +451,7 @@ func TestLotEventForAClosedLotWithoutExtension(t *testing.T) {
 	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 102 })
 	pub.Step(context.Background())
 
-	evs := eventsOfKind(rec, KindLot)
+	evs := lotShapeEvents(t, rec)
 	if len(evs) != 1 {
 		t.Fatalf("lot events = %d, want exactly 1", len(evs))
 	}
@@ -537,7 +551,7 @@ func TestLotRefusedWhenAnchorHashUnknown(t *testing.T) {
 	ctx := context.Background()
 	pub.Step(ctx)
 
-	if got := len(eventsOfKind(rec, KindLot)); got != 0 {
+	if got := len(lotShapeEvents(t, rec)); got != 0 {
 		t.Fatalf("an unanchorable lot event must not be published, got %d", got)
 	}
 	found := false
@@ -553,7 +567,7 @@ func TestLotRefusedWhenAnchorHashUnknown(t *testing.T) {
 	// The hash becomes readable: the very next pass publishes it.
 	readable = true
 	pub.Step(ctx)
-	evs := eventsOfKind(rec, KindLot)
+	evs := lotShapeEvents(t, rec)
 	if len(evs) != 1 {
 		t.Fatalf("lot events after the hash became readable = %d, want 1", len(evs))
 	}

@@ -99,7 +99,7 @@ func p2pkOut(recipient, nonce string) string {
 // settle -> sellerKey, refund -> the bidder's own wallet key. One output per
 // input, same amounts, same keyset (spec §1.2). The bidder signs each
 // template's layout-B digest with the wallet spend key it locked to.
-func (m *testMint) templates(t *testing.T, b bidder, sellerKey string, proofs []Proof) *sigAllOutcomeTemplates {
+func (m *testMint) templates(t *testing.T, b bidder, sellerKey string, proofs []Proof, tag string) *sigAllOutcomeTemplates {
 	t.Helper()
 	build := func(recipient string) sigAllSignedTemplate {
 		var inputs []sigAllTemplateInput
@@ -107,7 +107,7 @@ func (m *testMint) templates(t *testing.T, b bidder, sellerKey string, proofs []
 		for i, p := range proofs {
 			inputs = append(inputs, sigAllTemplateInput{Amount: p.Amount, ID: p.ID, Secret: p.Secret, C: p.C})
 			outputs = append(outputs, sigAllTemplateOutput{Amount: p.Amount, ID: p.ID,
-				Secret: p2pkOut(recipient, fmt.Sprintf("%064x", 0x2000+i+1)),
+				Secret: p2pkOut(recipient, fmt.Sprintf("%s-%064x", tag, 0x2000+i+1)),
 				R:      fmt.Sprintf("%064x", 0x100000+i+1)})
 		}
 		tpl := sigAllSignedTemplate{Inputs: inputs, Outputs: outputs}
@@ -168,6 +168,13 @@ const tNow = int64(1_800_000_000)
 // its (seller, d) coordinate with a genuine auction_root_event_id — the id it
 // returns is that root id, and bids bind to it.
 func liveApp(t *testing.T) (*App, *testMint, string) {
+	a, m, id, _ := liveAppSeller(t)
+	return a, m, id
+}
+
+// liveAppSeller is liveApp plus the lot's OWN seller bidder, so a test can sign
+// an event as the seller (whose key liveApp otherwise keeps to itself).
+func liveAppSeller(t *testing.T) (*App, *testMint, string, bidder) {
 	m := newTestMint(t)
 	group := hex.EncodeToString(mulG(new(btcec.ModNScalar).SetInt(7)).SerializeCompressed())
 	a := NewApp()
@@ -188,7 +195,7 @@ func liveApp(t *testing.T) (*App, *testMint, string) {
 	// The returned id is the auction's coordinate a = 1440:<seller>:<d> — the
 	// key it is stored under and what bids carry in their content. Its root
 	// event id (what a bid binds to via e) is au.RootID.
-	return a, m, coordOf(seller.pub, "lot-42")
+	return a, m, coordOf(seller.pub, "lot-42"), seller
 }
 
 // sellerWallet is the committed seller payout key of the liveApp lot, so a
@@ -217,7 +224,7 @@ func (m *testMint) bidTx(t *testing.T, a *App, b bidder, auction string, amount 
 		}
 	}
 	c, _ := json.Marshal(BidContent{Auction: au.ID, Amount: amount, Wallet: b.wallet, Name: "t", Proofs: proofs,
-		OutcomeTemplates: m.templates(t, b, au.SellerWallet, proofs)})
+		OutcomeTemplates: m.templates(t, b, au.SellerWallet, proofs, nonce)})
 	// every bid binds to the auction root: e = auction_root_event_id, plus our
 	// own coordinate a = 1440:<seller>:<d>.
 	ev := signEventTags(t, b.sk, KindBid, string(c), tNow, [][]string{{"e", au.RootID}, {"a", au.ID}})
@@ -237,28 +244,34 @@ func finalize(t *testing.T, a *App, h, at int64, txs ...[]byte) *abci.FinalizeBl
 	return res
 }
 
+// The void path is for a genuine RACE: a bid that passed admission (its delta
+// cleared the floor then) and was overtaken before its block. R3 refuses a bid
+// that is late ON ARRIVAL at CheckTx -- see TestBelowFloorBidIsRefusedAtAdmission
+// -- but it must not refuse one that was good when it entered the mempool.
 func TestLateBidIsVoidAndRefundable(t *testing.T) {
 	a, m, id := liveApp(t)
 	alice, bob := newBidder(t), newBidder(t)
 	ev1, tx1 := m.bidTx(t, a, alice, id, 200, "aa")
-	ev2, tx2 := m.bidTx(t, a, bob, id, 150, "bb") // below 200+10: lost the race
+	ev2, tx2 := m.bidTx(t, a, bob, id, 150, "bb") // below 200+10 once Alice commits
 
-	// CheckTx: the late bid passes with a "late:" note, so the client knows at once
-	ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx1})
+	// Both clear admission BEFORE either block lands: Bob's 150 beats the
+	// opening price (100), so this is a legitimate race, not a late bid.
+	ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx2})
+	if ck.Code != 0 || ck.Log != "" {
+		t.Fatalf("the racer must pass admission: %d %q", ck.Code, ck.Log)
+	}
+	ck, _ = a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx1})
 	if ck.Code != 0 || ck.Log != "" {
 		t.Fatalf("good bid: %d %q", ck.Code, ck.Log)
 	}
-	res := finalize(t, a, 11, tNow+1, tx1)
-	if res.TxResults[0].Code != 0 {
-		t.Fatalf("bid 1: %v", res.TxResults[0].Log)
+	// One block, in this order: Alice's leg sets the floor at 210, then Bob's is
+	// decided against it and is void, refundable now.
+	res := finalize(t, a, 11, tNow+1, tx1, tx2)
+	if r := res.TxResults[0]; r.Code != 0 {
+		t.Fatalf("bid 1: %v", r.Log)
 	}
-	ck, _ = a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx2})
-	if ck.Code != 0 || !strings.HasPrefix(ck.Log, "late: bid must be at least 210") {
-		t.Fatalf("late bid CheckTx: %d %q", ck.Code, ck.Log)
-	}
-	res = finalize(t, a, 12, tNow+2, tx2)
-	if r := res.TxResults[0]; r.Code != 0 || !strings.HasPrefix(r.Log, "void: ") {
-		t.Fatalf("late bid FinalizeBlock: %d %q", r.Code, r.Log)
+	if r := res.TxResults[1]; r.Code != 0 || !strings.HasPrefix(r.Log, "void: bid must add at least 210") {
+		t.Fatalf("the overtaken bid must be void at delivery: %d %q", r.Code, r.Log)
 	}
 	au, b := a.st.Auctions[id], a.st.Bids[ev2.ID]
 	if b == nil || b.Status != "void" || au.HighBid != ev1.ID || len(au.Bids) != 1 || len(au.Voids) != 1 {

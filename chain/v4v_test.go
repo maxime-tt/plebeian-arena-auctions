@@ -27,7 +27,6 @@ func splitRow(role, pub string, bps int64) SplitRow {
 	return SplitRow{Role: role, RecipientPubkey: pub, AllocationBps: json.Number(strconv.FormatInt(bps, 10))}
 }
 
-
 // createWithD signs a 1440 create carrying the `d` tag every create now needs:
 // an auction's identity is (seller, d) and a create without a valid d is
 // refused. These tests do not care which d it is.
@@ -208,10 +207,10 @@ func TestV4VSplitEditRefusedByName(t *testing.T) {
 // mkOut builds one plain P2PK output locked to recipient with a fresh blinding
 // factor. The secret must be a canonical plain P2PK lock with just a sigflag
 // tag, which is what recipientMatches accepts as a settled destination.
-func mkOut(recipient string, amount int64, idx int, keyset string) sigAllTemplateOutput {
+func mkOut(recipient string, amount int64, idx int, keyset, tag string) sigAllTemplateOutput {
 	return sigAllTemplateOutput{
 		Amount: amount, ID: keyset,
-		Secret: p2pkOut(recipient, fmt.Sprintf("%064x", 0x3000+idx+1)),
+		Secret: p2pkOut(recipient, fmt.Sprintf("%s-%064x", tag, 0x3000+idx+1)),
 		R:      fmt.Sprintf("%064x", 0x400000+idx+1),
 	}
 }
@@ -256,7 +255,7 @@ func v4vBid(t *testing.T, a *App, m *testMint, b bidder, auction string, amount 
 	}
 	var sout []sigAllTemplateOutput
 	for j, so := range splitSats(au.SellerWallet, au.V4VSplit, amount) {
-		sout = append(sout, mkOut(so.Recipient, so.Amount, j, m.id))
+		sout = append(sout, mkOut(so.Recipient, so.Amount, j, m.id, nonce))
 	}
 	settle := sigAllSignedTemplate{Outputs: sout}
 	if mutateSettle != nil {
@@ -266,7 +265,7 @@ func v4vBid(t *testing.T, a *App, m *testMint, b bidder, auction string, amount 
 
 	var rout []sigAllTemplateOutput
 	for j, p := range proofs {
-		rout = append(rout, mkOut(b.wallet, p.Amount, 100+j, m.id))
+		rout = append(rout, mkOut(b.wallet, p.Amount, 100+j, m.id, nonce))
 	}
 	refund := sigAllSignedTemplate{Outputs: rout}
 	if mutateRefund != nil {
@@ -315,7 +314,7 @@ func TestV4VSettleTemplateAddsRecipientRefused(t *testing.T) {
 	attacker := realPub(t, 99)
 	ev, _ := v4vBid(t, a, m, bob, id, 200, "ac", func(tpl *sigAllSignedTemplate) {
 		// keep the sum at 200 by taking a sat from the seller remainder output
-		tpl.Outputs = append(tpl.Outputs, mkOut(attacker, 1, 50, m.id))
+		tpl.Outputs = append(tpl.Outputs, mkOut(attacker, 1, 50, m.id, "ac"))
 		tpl.Outputs[len(tpl.Outputs)-2].Amount -= 1
 	}, nil)
 	err := a.st.applyBid(ev, tNow, 11, true, true)
@@ -358,7 +357,7 @@ func TestV4VRefundTemplateWithSplitRowRefused(t *testing.T) {
 	bob := newBidder(t)
 	ev, _ := v4vBid(t, a, m, bob, id, 200, "af", nil, func(tpl *sigAllSignedTemplate) {
 		// pay the first committed V4V recipient from the refund branch
-		tpl.Outputs[0].Secret = mkOut(recipient, tpl.Outputs[0].Amount, 0, m.id).Secret
+		tpl.Outputs[0].Secret = mkOut(recipient, tpl.Outputs[0].Amount, 0, m.id, "af").Secret
 	})
 	err := a.st.applyBid(ev, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "refund output 0 pays a committed v4v split recipient") {
