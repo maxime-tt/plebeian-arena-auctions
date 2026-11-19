@@ -131,6 +131,10 @@ await until(async () => (await c.bidWithProofs(b1.id)).settled === 'refund', 100
 ok(true, 'settle tx recorded on chain');
 await expectReject(c.claim(alice, s.bids[b1.id], 'refund', s.params), /settled|spent/i, 'a pull release of the pushed escrow is refused');
 await expectReject(placeBid(carol, A, 115), /at least 120/, 'under-increment bid stopped by the client before locking');
+// The R3 refusal leaves the locked escrow untouched, so Carol's 115 stays
+// locked until its own locktime: her spendable balance is 115 short for the rest
+// of the walk, and the conservation step counts it as pendingReclaim.
+const REFUSED_LOCK = 115;
 {
   // R3: an economically late bid is REFUSED AT ADMISSION. The chain never
   // commits it and never records a void, so the locked escrow is simply left
@@ -140,17 +144,18 @@ await expectReject(placeBid(carol, A, 115), /at least 120/, 'under-increment bid
   // mempool and was OVERTAKEN before its block (chain/live_test.go,
   // TestLateBidIsVoidAndRefundable).
   const st = await c.state();
-  const { locked } = await c.lockForBid(carol, 115, st.params, st.auctions[A], { force: true, state: st });
+  const { locked } = await c.lockForBid(carol, REFUSED_LOCK, st.params, st.auctions[A], { force: true, state: st });
   stranded.push({ u: carol, locked });
-  await expectReject(c.bid(carol, st.auctions[A], 115, locked), /at least 120/, 'the chain REFUSES the under-increment bid at admission');
+  await expectReject(c.bid(carol, st.auctions[A], REFUSED_LOCK, locked), /at least 120/, 'the chain REFUSES the under-increment bid at admission');
   const sv = await c.state();
-  const carol115 = sv.auctions[A].bids.map((b) => sv.bids[b]).filter((b) => b.bidder === idPub(carol) && b.amount === 115);
+  const carol115 = sv.auctions[A].bids.map((b) => sv.bids[b]).filter((b) => b.bidder === idPub(carol) && b.amount === REFUSED_LOCK);
   ok(carol115.length === 0, 'no bid of Carol\'s 115 is on the chain (never committed)');
   ok((sv.auctions[A].voids || []).length === 0, 'and the lot records no void for it');
   ok(sv.auctions[A].highBid === b2.id && sv.bids[b2.id].status === 'leading', 'Bob still leads');
-  ok(await bal(carol) === 885, 'the refused escrow is untouched: Carol still holds 885 (115 locked until locktime)');
+  ok(await bal(carol) === 1000 - REFUSED_LOCK, `the refused escrow is untouched: Carol still holds ${1000 - REFUSED_LOCK} (${REFUSED_LOCK} locked until locktime)`);
   const v = await c.view([idPub(carol)]);
-  ok(!Object.values(v.state.bids).some((b) => b.amount === 115), 'the refusal left no bid, void or otherwise, in Carol\'s own view');
+  ok(!Object.values(v.state.bids).some((b) => b.auction === A && b.bidder === idPub(carol) && b.amount === REFUSED_LOCK),
+    'the refusal left no bid of Carol\'s on this lot in her own view');
 }
 await expectReject((async () => { const st = await c.state(); return c.bid(seller, st.auctions[A], 500, []); })(), /proof count/, 'a bid without an escrow is refused outright');
 
@@ -173,7 +178,7 @@ const net1 = await c.network();
 ok(!net1[3].up && net1.slice(0, 3).every((v) => v.up && v.height >= b4.state.bids[b4.id].height), 'V4 down, V1-V3 commit the next bid');
 ok(b4.state.auctions[A].highBid === b4.id, 'Alice leads at 250 with only 3 validators');
 const p3 = await pushed(carol, b3.id, "Carol's refund", t);
-ok(!p3.cosigners.includes('Validator 4') && p3.cosigners.length === 3 && await bal(carol) === 1000, `Carol refunded by ${p3.cosigners.join(', ')} while V4 is offline · ${msTxt(p3)}`);
+ok(!p3.cosigners.includes('Validator 4') && p3.cosigners.length === 3 && await bal(carol) === 1000 - REFUSED_LOCK, `Carol refunded by ${p3.cosigners.join(', ')} while V4 is offline · ${msTxt(p3)}`);
 
 step(6, 'Auction closes at the end; the payout is pushed to the seller');
 s = await until(async () => { const st = await c.state(); return st.auctions[A].status === 'closed' && st; }, 200000, 'close');

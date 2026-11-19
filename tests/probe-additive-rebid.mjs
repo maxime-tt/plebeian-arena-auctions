@@ -224,6 +224,13 @@ const bothSettled = await attempt(until(async () => {
 }, 180000, 'both won legs to settle'), 'both won legs to settle');
 if (!bothSettled) { await finish(); }
 ok(true, 'both legs are recorded settled:settle');
+// The money: take the per-leg settle outputs into the seller's wallet, exactly
+// as a client does with the pushed ecash.
+const settledProofs = [leg1.id, leg2.id].flatMap((id) => bothSettled.bids[id].out);
+const sellerKey = walletPub(seller).toLowerCase();
+ok(settledProofs.every((p) => String(JSON.parse(p.secret)[1].data).toLowerCase() === sellerKey),
+  'every settled output is P2PK-locked to the committed seller wallet key');
+await c.receive(seller, settledProofs);
 const sellerBal = await c.balance(seller);
 ok(sellerBal === auC.highAmount, `the seller received the SUM of the legs: ${sellerBal} == highAmount ${auC.highAmount}`);
 
