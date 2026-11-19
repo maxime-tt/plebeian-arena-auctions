@@ -56,12 +56,21 @@ type settleAttempt struct {
 	Outcome   string       `json:"outcome"`
 	To        string       `json:"to"`
 	Auction   string       `json:"auction,omitempty"`
-	Outputs   []SignOutput `json:"outputs"`          // the committed template's outputs (recomputed B_)
-	Reveal    []Reveal     `json:"reveal"`           // their secrets and openings, from the committed template
-	BidderSig string       `json:"bidder_sig"`       // the bidder's pre-signature over the committed digest
-	Sig       string       `json:"sig,omitempty"`    // the committee's FROST signature
-	Proofs    []Proof      `json:"proofs,omitempty"` // set once unblinded
+	Outputs   []SignOutput `json:"outputs,omitempty"`    // the committed template's outputs (recomputed B_)
+	Reveal    []Reveal     `json:"reveal,omitempty"`     // their secrets and openings, from the committed template
+	BidderSig string       `json:"bidder_sig,omitempty"` // the bidder's pre-signature over the committed digest
+	Sig       string       `json:"sig,omitempty"`        // the committee's FROST signature
+	Proofs    []Proof      `json:"proofs,omitempty"`     // set once unblinded
 	At        int64        `json:"at"`
+
+	// A FAILED swap appends a SECOND record for the same attempt, carrying the
+	// two fields below and no outputs. They are what the old error threw away:
+	// the mint's HTTP status and its response body verbatim (empty/0 for a
+	// transport failure, where no status exists). The attempt's own identifiers
+	// (bid, outcome, to, auction, at) and every existing key are unchanged, so
+	// an already-written journal stays readable; only the new keys are added.
+	HTTPStatus int    `json:"http_status,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 type settler struct {
@@ -262,12 +271,9 @@ func (s *settler) settle(it dueMove, height int64) error {
 	}
 	a := &settleAttempt{Bid: it.Bid.ID, Outcome: it.Outcome, To: it.To, Auction: it.Bid.Auction,
 		Outputs: outs, Reveal: reveal, BidderSig: bidderSig, At: time.Now().Unix()}
-	if err := s.write(a); err != nil {
-		return fmt.Errorf("journal: %w", err)
+	if err := s.journalSubmission(a); err != nil {
+		return err
 	}
-	s.mu.Lock()
-	s.tries[a.Bid] = append(s.tries[a.Bid], a)
-	s.mu.Unlock()
 	// The settler names the bid and the outcome only; the validators derive the
 	// outputs from the committed template themselves (spec §5).
 	req, _ := json.Marshal(SignReq{Bid: a.Bid, Outcome: a.Outcome, Height: height})
@@ -277,7 +283,7 @@ func (s *settler) settle(it dueMove, height int64) error {
 		return fmt.Errorf("validators refused (%d): %s %v", code, res.Error, res.Refusals)
 	}
 	a.Sig = res.Signature
-	sigs, err := s.swap(it.Bid.Proofs, a.Outputs, a.BidderSig, a.Sig)
+	sigs, err := s.swapAndJournal(a, it.Bid.Proofs)
 	tMint := time.Since(t0) - tFrost
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "spent") {
@@ -316,6 +322,61 @@ func (s *settler) post(path string, body any, out any) (int, []byte, error) {
 	return resp.StatusCode, raw, nil
 }
 
+// journalSubmission writes the attempt's own record and keeps it in memory for
+// crash recovery (recover). It is the record that swapAndJournal appends a
+// failure record beside when the mint refuses the swap.
+func (s *settler) journalSubmission(a *settleAttempt) error {
+	if err := s.write(a); err != nil {
+		return fmt.Errorf("journal: %w", err)
+	}
+	s.mu.Lock()
+	s.tries[a.Bid] = append(s.tries[a.Bid], a)
+	s.mu.Unlock()
+	return nil
+}
+
+// mintSwapError is a swap the mint REFUSED: it answered, but not with the
+// signatures. It carries what the old error discarded -- the HTTP status and
+// the response body verbatim -- and names the mint, so a log line or a journal
+// record says which mint answered what (e.g. a 400 whose body is the bare
+// stringified amount), not the mint's detail alone.
+type mintSwapError struct {
+	Mint   string
+	Status int
+	Body   string
+}
+
+func (e *mintSwapError) Error() string {
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		body = "(empty body)"
+	}
+	return fmt.Sprintf("mint swap at %s refused: HTTP %d: %s", e.Mint, e.Status, body)
+}
+
+// swapAndJournal is the balance of settle's mint half: it submits the swap and,
+// when the mint refuses or cannot be reached, appends the failure record beside
+// the attempt (see settleAttempt.HTTPStatus / .Error) so an operator can read
+// why from the journal alone. A failure to journal is logged, never allowed to
+// mask the swap error.
+func (s *settler) swapAndJournal(a *settleAttempt, inputs []Proof) ([]blindSig, error) {
+	sigs, err := s.swap(inputs, a.Outputs, a.BidderSig, a.Sig)
+	if err != nil {
+		f := &settleAttempt{Bid: a.Bid, Outcome: a.Outcome, To: a.To, Auction: a.Auction, At: a.At, Error: err.Error()}
+		var mse *mintSwapError
+		if errors.As(err, &mse) {
+			f.HTTPStatus = mse.Status
+		}
+		if werr := s.write(f); werr != nil {
+			log.Printf("settle %s %s: journal the swap failure: %v", a.Outcome, a.Bid[:min(len(a.Bid), 12)], werr)
+		}
+		s.mu.Lock()
+		s.tries[a.Bid] = append(s.tries[a.Bid], f)
+		s.mu.Unlock()
+	}
+	return sigs, err
+}
+
 // swap spends the escrow's committed proofs against the committed template's
 // outputs, with the witness carrying BOTH signatures: the bidder's (from the
 // committed template) and the committee's (from the FROST round). The mint
@@ -338,17 +399,20 @@ func (s *settler) swap(inputs []Proof, outs []SignOutput, bidderSig, committeeSi
 	}
 	var r struct {
 		Signatures []blindSig `json:"signatures"`
-		Detail     string     `json:"detail"`
 	}
 	code, raw, err := s.post("/v1/swap", map[string]any{"inputs": ins, "outputs": outs}, &r)
 	if err != nil {
-		return nil, err
+		// No HTTP status exists: the mint did not answer. Keep this distinct
+		// from a refusal, which has a status and a body, so an operator can
+		// tell "the mint is unreachable" from "the mint said no".
+		return nil, fmt.Errorf("mint unreachable at %s: %w", s.mint, err)
 	}
-	if code != 200 || len(r.Signatures) != len(outs) {
-		if r.Detail == "" {
-			r.Detail = strings.TrimSpace(string(raw))
-		}
-		return nil, fmt.Errorf("mint swap: %s", r.Detail)
+	if code != 200 {
+		return nil, &mintSwapError{Mint: s.mint, Status: code, Body: string(raw)}
+	}
+	if len(r.Signatures) != len(outs) {
+		return nil, fmt.Errorf("mint swap at %s: HTTP %d with %d signatures for %d outputs",
+			s.mint, code, len(r.Signatures), len(outs))
 	}
 	return r.Signatures, nil
 }
@@ -389,7 +453,10 @@ func (s *settler) recover(it dueMove) error {
 	s.mu.Unlock()
 	for i := len(tries) - 1; i >= 0; i-- {
 		a := tries[i]
-		if a.Outcome != it.Outcome {
+		if a.Outcome != it.Outcome || len(a.Outputs) == 0 {
+			// Not a submission of this outcome. A record with no outputs is a
+			// swap-failure record (settleAttempt.Error), not an attempt: it has
+			// nothing to restore and must not stop the search.
 			continue
 		}
 		var r struct {
