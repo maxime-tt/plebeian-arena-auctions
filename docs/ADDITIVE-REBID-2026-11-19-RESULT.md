@@ -28,8 +28,8 @@ No state-schema change, no new `Bid` field, no reset, no `arena init`.
 | 3 | `chain/app.go:842-846` | `au.HighBid, au.HighAmount = ev.ID, own+b.Amount` — position, not delta; invariant stated in the comment. |
 | 4 | `chain/app.go:855-879` (`closeDue`) | every `leading` leg → `won`, everything else → `lost`, keyed on the **status**, never on the bidder. |
 | 5 | `chain/app.go:883-899` (`positionOf`) | one place that answers "the position this bid belongs to" (only for `leading`/`won`), used by the publisher. |
-| 6 | `chain/app.go:920-952` (`CheckTx`, bid branch) | **R3**: `applyBid(..., apply=false, timed=true)` with the wall clock; a `lateBid` is answered `Code 2` with the reason (refuse), so it is never committed. Cryptography is untouched; `void` remains the delivery-time answer (see §3). |
-| 7 | `chain/settle.go:90-100` (`outcomeDue`) | settle is due for **any** `won` leg of a closed lot (`bid.Status == "won"`), not only `au.Winner`. |
+| 6 | `chain/app.go:940-973` (`CheckTx`, bid branch) | **R3**: `applyBid(..., apply=false, timed=true)` with the wall clock; a `lateBid` is answered `Code 2` with the reason (refuse), so it is never committed. Cryptography is untouched; `void` remains the delivery-time answer (see §3). |
+| 7 | `chain/settle.go:91-101` (`outcomeDue`) | settle is due for **any** `won` leg of a closed lot (`bid.Status == "won"`), not only `au.Winner`. |
 | 8 | `chain/lotevents.go:58`, `:233-326` | **R4**: `BidAdmitSchema = "arena.bidadmit.v1"`, `BidAdmitContent`, `check()`, `BuildBidAdmitEvent`, `ParseBidAdmitEvent`, five named refusals. Kind 1449 now carries two schemas (`arena.lot.v1` and `arena.bidadmit.v1`); each parser refuses the other's shape **by name**. |
 | 9 | `chain/verdictpublish.go:125`, `:580-632` (`publishLots`) | **R4**: a second loop in the lot-state publisher publishes the admission fact for every admitted bid that is still `leading` or `won`, anchored at **that bid's own committed height**, deduped per bid id. |
 | 10 | `chain/nostr.go:53` | the `KindLot` comment names the admission shape. |
