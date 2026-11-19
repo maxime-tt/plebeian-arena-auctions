@@ -293,8 +293,9 @@ func cmdNode(args []string) {
 	// ANCHOR PROVES: every verdict is published only after its block is
 	// committed, anchored to that committed block's hash, read here from the
 	// node's own block store.
+	var verdictPub *Publisher
 	if len(relays) > 0 {
-		startVerdictPublish(app, n, home, i, relays, *commitMax)
+		verdictPub = startVerdictPublish(app, n, home, i, relays, *commitMax)
 	}
 
 	mux := http.NewServeMux()
@@ -354,6 +355,11 @@ func cmdNode(args []string) {
 		bs := n.BlockStore()
 		h := bs.Height()
 		out := map[string]any{"name": names[i], "index": i + 1, "height": h, "peers": n.Switch().Peers().Size(), "frostParticipant": fk.Participant, "groupKey": fk.GroupKey}
+		// The publisher's transport state, so a dead relay is visible HERE
+		// instead of only as missing events on the relay.
+		if verdictPub != nil {
+			out["publish"] = verdictPub.RelayHealth()
+		}
 		if meta := bs.LoadBlockMeta(h); meta != nil {
 			out["time"] = meta.Header.Time.Unix()
 			out["appHash"] = hex.EncodeToString(meta.Header.AppHash)
@@ -628,18 +634,22 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 // the ABCI app itself cannot see.  A misconfiguration is logged and disables
 // publishing -- it never takes the validator down, because publishing is a
 // notification path, not the chain.
-func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []string, commitMax time.Duration) {
+//
+// It returns the publisher (nil when publishing is off) so the validator's
+// /status can serve its transport health: a relay that went away must be
+// visible from outside, not inferred from events that stopped appearing.
+func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []string, commitMax time.Duration) *Publisher {
 	vk, err := loadVerdictKey(filepath.Join(home, "config", "verdict_key.json"))
 	if err != nil {
 		log.Printf("%s: verdict publish off: %v", names[i], err)
-		return
+		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	writer, closeRelays, err := DialRelays(ctx, relays)
 	if err != nil {
 		cancel()
 		log.Printf("%s: verdict publish off: %v", names[i], err)
-		return
+		return nil
 	}
 	pub, err := NewPublisher(PublisherConfig{
 		Key: vk, Relay: writer, App: app, MaxInterval: commitMax,
@@ -655,7 +665,7 @@ func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []st
 		cancel()
 		closeRelays()
 		log.Printf("%s: verdict publish off: %v", names[i], err)
-		return
+		return nil
 	}
 	go pub.Run(ctx, time.Second)
 	// Tie the publisher's life to the node: it stops when the process exits.
@@ -665,4 +675,5 @@ func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []st
 		closeRelays()
 	}()
 	log.Printf("%s: publishing verdicts and state commitments to %v", names[i], relays)
+	return pub
 }

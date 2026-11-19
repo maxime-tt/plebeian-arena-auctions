@@ -692,6 +692,19 @@ func (p *Publisher) Records() []PublishRecord {
 	return append([]PublishRecord(nil), p.records...)
 }
 
+// RelayHealth reports, per relay, the state of the publish transport: whether
+// it is connected, how many attempts failed, and the last error.  A publish
+// failure used to be invisible outside the process -- recorded on a
+// PublishRecord and printed nowhere -- so an operator found it only by noticing
+// that no new events existed (incident 2026-11-19: 1h45m).  This is what the
+// validator's /status and the gateway's /api/publish serve.
+func (p *Publisher) RelayHealth() []PublishHealth {
+	if h, ok := p.relay.(interface{ Health() []PublishHealth }); ok {
+		return h.Health()
+	}
+	return nil
+}
+
 func hexOrEmpty(b []byte) string {
 	if len(b) == 0 {
 		return ""

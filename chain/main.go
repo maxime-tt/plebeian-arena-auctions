@@ -285,6 +285,42 @@ func cmdGateway(args []string) {
 		writeJSON(w, 200, out)
 	})
 
+	// Publish transport health.  The chain's outbound publisher froze for
+	// 1h45m on 2026-11-19 while the chain kept advancing, and nothing outside
+	// the process could see it: the relay just stopped receiving kinds 1443-
+	// 1450.  Each validator now reports, per relay, whether it is connected,
+	// how many attempts failed and the last error; this route aggregates them.
+	// curl 127.0.0.1:8090/api/publish is the outside check.
+	mu.HandleFunc("/api/publish", func(w http.ResponseWriter, r *http.Request) {
+		out := make([]map[string]any, 4)
+		var wg sync.WaitGroup
+		for i := range 4 {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				m := map[string]any{"name": names[i], "index": i + 1, "up": false}
+				if sup.running(i) {
+					resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/status", httpPort(i)))
+					if err == nil {
+						var status map[string]any
+						json.NewDecoder(resp.Body).Decode(&status)
+						resp.Body.Close()
+						m["up"] = true
+						if publish, ok := status["publish"]; ok {
+							m["relays"] = publish
+						} else {
+							m["relays"] = []PublishHealth{}
+							m["publishing"] = false
+						}
+					}
+				}
+				out[i] = m
+			}(i)
+		}
+		wg.Wait()
+		writeJSON(w, 200, out)
+	})
+
 	// Publish a signed Nostr event.  The relay is the transport and the
 	// discovery mechanism, but it is NOT enough on its own: the event is always
 	// also submitted directly to every validator's RPC, so the tx reaches the
