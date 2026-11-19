@@ -284,3 +284,134 @@ Options, in order of preference:
    reset. This weakens the §4 consistency rule (the field is unverifiable), so it needs an owner
    ruling and a documented trust rule (a client must still lock value to the *committed* keyset).
 3. **Accept a reset** whenever the advertised origin must change (§7), and keep the value in genesis.
+
+## 9. If a reset is authorised: it is only coherent together with a relay purge (measured 2026-11-19)
+
+The reset itself does **not** make the app read the new terms. The app's anchored readers take their
+facts from `wss://relay.playday.it`, and the old chain's events stay there; heights restart, so the
+two chains' anchors compete **in the same reader batch** and, for the reader that matters, the OLD
+one wins.
+
+### 9.1 The relay's answer set (this is what the readers see)
+
+Money-relay is a stock **khatru** app built from `~/work/market/deploy-simple/relay/cmd/market-relay/main.go`
+(`market-relay.service`, `127.0.0.1:7777`, Caddy → `wss://relay.playday.it`), BoltDB raw store +
+Bleve index, `RELAY_MAX_QUERY_LIMIT="500"` (`.config/market-relay.env`, `main.go:148`). A filter with
+no `limit` therefore returns **the newest ≤ 500 events by `created_at`**, newest first — the bolt
+query sorts `CompareEventReverse` and truncates to the limit
+(`fiatjaf.com/nostr@v0.0.0-20260314085316/eventstore/boltdb/query.go:161-170`). The app sends exactly
+that: `filters = [{kinds: [1448]}]`, bounded, no limit, no `since` (`arenaParamsRead.ts:492-503`),
+and a bounded read **does not** replay the browser's local store (`sdk/core/event-store/read.ts:137-141`).
+
+Stored now, measured with `nak req -k <kind> -l 500`: 1447 ≥500, **1448 ≥500**, 1449 ≥500,
+1450 72, 1443 108, 1444 84, 1445 ≥500, 1440 64, 1441 84 (21447 is ephemeral: nothing stored).
+
+### 9.2 The orderings, and which way each one breaks
+
+| reader | rule | after a reset |
+|---|---|---|
+| params (1448) | **highest** anchored height wins; ties → `created_at`, then id (`arenaParamsRead.ts:437-464`, the pick at `:460`) | **OLD wins** |
+| chain clock (1447) | highest **agreed** height, plus a no-regress guard that holds the previous anchor (`arenaClock.ts:148-205`, `:54` stale after 900 s) | **OLD wins**, then pinned |
+| lot state (1449) | **earliest** anchored height per auction id (`arenaLotStateRead.ts:499-512`) | new wins when both exist; OLD is all there is for a lot the new chain lacks |
+| refusals (1450) | earliest anchored height (`arenaLotStateRead.ts:520-533`) | same |
+| receipts (1443/1444) | earliest anchored height per `(bid, outcome)` (`arenaReceiptsRead.ts:465-478`) | OLD survives, and would beat a later re-publish |
+
+### 9.3 The concrete competing heights (params — the one the brief cares about)
+
+- OLD chain, measured live: kind-1448 **anchored at height 3100**, `app_hash dbda1367…ac49`,
+  `mint_url http://127.0.0.1:3338` (id `7e4b4a67…e100f91d`, and the other three validators' twins).
+- NEW chain: heights **1 … N** (or `3101…` if the new genesis sets `initial_height`, see §9.5).
+
+So after a reset `selectNewestArenaParams` returns the **old** event and the app keeps reading
+`mint_url = loopback`. It stops only when the new chain's height **exceeds 3100** — at the idle
+cadence of one block a minute (`chain/node.go:63`, `CreateEmptyBlocksInterval = 60s`) that is
+**≈ 2.2 days**, sooner under traffic. A second clock also runs: the old event leaves the answer set
+only once **500 newer kind-1448s** exist, and params are (re)published on the first pass after start
+and then every `StateCommitEvery = 100` blocks (`verdictpublish.go:237-238`, `chain/verdict.go:97`)
+— 4 validators × 125 publishes ≈ **12 500 blocks**. The height condition binds first, so the app
+would read the old terms for ~2+ days; the clock is worse (it is frozen at 3100 by the no-regress
+guard and ages to `stale` on its own).
+
+### 9.4 What must happen in the same operation
+
+1. **Purge the old chain's derived events from the relay** — kinds **1447, 1448, 1449, 1450, 1445,
+   1443, 1444**. Without this the reset is not coherent: params and the clock keep the old chain.
+2. Decide what to do with the auction inputs (1440 creates, 64; 1441 bids, 84): leave them and the
+   new chain **re-ingests them** (no cursor on a fresh root → the observer subscribes with no `since`,
+   `relayobserve.go:386-396` + `relaycursor.go`), recreating the lots at new heights with fresh ends
+   (`applyCreate` ends at `now + DurationSec`) while the old bids land as `void`/refused — noisy but
+   self-consistent; **or** purge them too for an empty app list; **or** pre-seed each validator's
+   `vN/data/relay-cursor.json` with `{"wss://relay.playday.it":{"created_at":<now>,"event_id":""}}`
+   to stop the replay and keep the relay's listings as read-only history.
+3. **Do not inherit the settle journal.** It is `filepath.Dir(root)/settle-journal.jsonl`
+   (`chain/main.go:346`), so a new root under `run/` reuses `run/settle-journal.jsonl` and the
+   settler would retry the old bids' swaps forever. Put the new root outside `run/` (or move that
+   file aside).
+4. Then restart and verify: a kind-1448 with `mint_url https://mint.playday.it`, tags and content
+   agreeing on `(height, app_hash)`, and no higher-anchored old event left in the answer set.
+
+### 9.5 The purge IS required — the cheap alternatives do not work
+
+- **`initial_height` jump** (the field exists: the deployed genesis carries `"initial_height":"1"`,
+   `chain/node.go:217` leaves the default): setting it to `3101` makes every *newest-wins* reader
+  prefer the new chain **but inverts the *earliest-wins* readers** (1449/1450/1443/1444 would then
+  prefer the old ≤3100 facts for a lot/bid present on both). Not sufficient alone.
+- **Reader-side filtering** would need a chain identity in the anchor; there is none — the kind-1447/1448
+  tags are `height`, `hash`, `p` only (`chain/verdict.go:615-619`), so two chains are
+  indistinguishable except by height.
+
+### 9.6 Removing the events (no admin surface exists)
+
+The relay exposes only `/healthz` (`main.go:74-79`); there is no management API and no CLI purge.
+Two real options, in order of cost:
+
+- **(A) NIP-09 deletes signed by the four validator keys.** khatru honours kind-5
+  (`khatru/deleting.go:20-71`) and **only the event's own author may delete it** (`:66-68`), routed
+  to our composite store so raw **and** Bleve are both updated (`main.go:210-216`). Each validator's
+  Nostr secret is in `vN/config/verdict_key.json` (`chain/node.go:210-212`), so the four keys can
+  publish kind-5s naming their own chain events (`e` tags for ids; `a` tags for addressable ones,
+  capped at the request's `created_at`). Exact, incremental, no downtime, nothing else on the relay
+  is touched — but it cannot remove the client-authored 1440/1441 (not our keys), and it means
+  enumerating every id (≥1 000 events across the four validators just for 1447/1448/1449/1445).
+- **(B) Wipe the relay's store.** `systemctl --user stop market-relay; mv
+  ~/.local/share/market-relay ~/.local/share/market-relay.bak-$(date +%Y%m%d); systemctl --user
+  start market-relay` (93 MB raw + 87 MB Bleve). Total, instant, trivially reversible by moving the
+  directory back — but it also erases the **market's own** events: this is the app's application
+  relay (`RELAY_DESCRIPTION="Application relay for the playday.it e2e instance"`), so listings,
+  profiles, orders and chat go too and the app must be re-seeded (`~/work/wt-e2e/scripts/dev-seed.ts`,
+  `gen_*.ts`). Needs app-side sign-off.
+- A third, surgical variant: a small Go program over `eventstoreboltdb`+`eventstorebleve` that copies
+  every event **except** the chain kinds (or except the four validator authors), then swap
+  `raw/events.db` and drop the Bleve directory (an invalid index is re-created on start,
+  `main.go:176-188`).
+
+### 9.7 What a reset would invalidate, and what it fixes
+
+**Fixes:** the 18 stranded escrows and the stuck non-denomination bids are chain state, so a new
+genesis has none of them — the settler's retry loop stops (with §9.4-3 done), and params can
+advertise `https://mint.playday.it`, so the dial URL is browser-reachable by construction (the
+app-side resolver keeps working either way).
+
+**Invalidates:** every lot, bid, verdict (1445), receipt (1443/1444) and refusal (1450) in chain
+state, and — until the relay is purged — the app's readings of them (they become orphan facts that
+can outrank the new chain, §9.2); lots visible in the app from the relay's 1440s are not bid-able
+until they are re-ingested. The **mint is untouched**: escrow proofs stay locked at `127.0.0.1:3338`,
+so the sats are not destroyed, but the chain path to them dies. The raw material for a *unilateral*
+refund survives on the relay, in the 1441 bid event itself (`wallet`, `proofs`,
+`outcome_templates` — `arenaBidPublish.ts:34,174-177,230`) — [INFERENCE] so a bidder could still
+reclaim after locktime if the app re-derives the template from the relay rather than from chain
+state; that is app-side work and was not tested.
+
+### 9.8 Recommendation
+
+- **(a) No reset** — keep the app-side resolver (`FixWalletMints`, `d7s2/app-wallet-mints` @
+  `5080231ae`), which is verified working and makes the loopback params harmless; optionally add the
+  non-hashed dial hint (§8-2) later under an owner ruling. Zero destructive steps, nothing to purge,
+  the escrow records survive. Steps: none beyond what is shipped; if the hint is wanted, one chain
+  change + one app read.
+- **(b) Reset** — authorised in principle; the coherent minimum is: (1) stop the chain unit; (2)
+  build the keys-preserving genesis with `mint_url = https://mint.playday.it` (§7), root **outside
+  `run/`**; (3) purge kinds 1447/1448/1449/1450/1445/1443/1444 from the relay (§9.6-A if the app's
+  own events must survive, §9.6-B if a full wipe is acceptable); (4) decide 1440/1441 as in §9.4-2;
+  (5) restart, then verify a fresh kind-1448 (public `mint_url`, agreeing anchors) and that no
+  higher-anchored old event remains. Until (3) is done the reset does **not** change what the app reads.
