@@ -352,9 +352,13 @@ func makeClose(id string, endAt, now int64) []byte {
 	return []byte(fmt.Sprintf("%s%s:%d:%d", closePrefix, id, endAt, now))
 }
 
-// lateBid is a bid that is well formed and fully locked to the escrow key
-// but lost a race (too low, already leading, lot ended). The chain records
-// it as void so the validators can refund it at once (ADR 0007).
+// lateBid marks a bid that lost the race on the ECONOMY alone: the lot was
+// closed, the bidder is the seller, or the delta left the bidder below the
+// position floor. At delivery it has already been verified in full (applyBid
+// runs the escrow before it commits anything), so the chain records it as
+// void and the validators can refund it at once (ADR 0007). At CheckTx the
+// same marker is what the mempool short-circuit returns BEFORE any escrow
+// work, so a refused-at-admission bid may never have had its escrow checked.
 type lateBid struct{ reason string }
 
 func (e *lateBid) Error() string { return e.reason }
@@ -698,7 +702,76 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if a, ok := tagValue(ev.Tags, "a"); ok && a != au.ID {
 		return errors.New("bid's a coordinate does not match the auction")
 	}
-	// 1. Is it a real, fully locked escrow? If not, refuse it outright.
+	// 1. Is it economically admissible? This is the CHEAP half of the
+	// transition -- pure arithmetic, no cryptography -- and it runs FIRST so a
+	// bid that is late ON ARRIVAL at CheckTx (apply == false) is refused
+	// before a single DLEQ or SIG_ALL is paid for: such a bid can never become
+	// valid (the position floor only rises, a closed lot stays closed, the
+	// seller never changes). A bid that CLEARS the economy is NOT admitted
+	// cheaply, though: it still pays the full escrow verification below, so the
+	// BID branch stays strict and no unverified bid reaches the mempool. At
+	// apply == true the escrow likewise runs BEFORE this bid is written or
+	// marked void -- that crypto/void ordering is load-bearing (a fabricated
+	// escrow must never become a committed void).
+	//
+	// A bid's Amount is a DELTA added to the bidder's POSITION, never a
+	// resulting total (app doctrine: ui/auction/arena/bid-rules.ts:155-165; the
+	// escrow IS this delta, see the proof-sum check below). The top is the
+	// leader's position, and every other bidder's position on this lot is ZERO:
+	// their earlier legs were outbid and are refundable, so the money they
+	// still hold here is nothing (plan §2.1).
+	//
+	// That makes the floor a POSITION floor -- the resulting position
+	// own+Amount must reach top+minIncrement -- and it makes a leader's own
+	// raise legal (R2-A): with additive deltas every positive Amount strictly
+	// raises the top, so no rule needs to forbid it. The old "you are already
+	// the highest bidder" case is therefore DELETED, not relaxed.
+	//
+	// INVARIANT (asserted in tests, and the chain's form of ADR-0003 S4.9):
+	// after any accepted bid au.HighAmount == Σ { bid.Amount : bid.Status ==
+	// "leading" } and, after close, == Σ { bid.Amount : bid.Status == "won" }.
+	own := int64(0)
+	if au.HighBid != "" && s.Bids[au.HighBid].Bidder == ev.Pubkey {
+		own = au.HighAmount // the leader's position IS the top
+	}
+	min := au.StartPrice // a first bid's position must reach the opening price
+	if au.HighBid != "" {
+		min = au.HighAmount + au.MinIncrement
+		if own > 0 {
+			min = own // the leader improving their own standing need only reach the top
+		}
+	}
+	var late error
+	switch {
+	case au.Status != "open" || (timed && now >= au.EndAt):
+		late = &lateBid{"auction closed"}
+	case ev.Pubkey == au.Seller:
+		late = &lateBid{"seller cannot bid on own lot"}
+	case b.Amount > math.MaxInt64-own:
+		// Byzantine guard: Amount is bounded by the proof-sum check below, but
+		// own accumulates over the leader's legs, so the SUM must not wrap.
+		return errors.New("position overflows")
+	case own+b.Amount < min:
+		late = &lateBid{fmt.Sprintf("bid must add at least %d sats: your position would reach %d, the floor is %d",
+			min-own, own+b.Amount, min)}
+	}
+	if late != nil && len(au.Voids) >= maxVoids {
+		return errors.New(late.Error() + " (late-bid limit reached for this lot)")
+	}
+	// Mempool short-circuit: at CheckTx a bid that is late ON ARRIVAL is
+	// refused right here, before any DLEQ/SIG_ALL work. A bid that clears the
+	// economy does NOT return here -- it falls through to the escrow block
+	// below, because admission stays strict about unverified bids (CHAIN-STATE
+	// HALF §3.3: admitting them would multiply the crypto across every
+	// validator). Only apply == true reaches the write path that follows.
+	if !apply && late != nil {
+		return late
+	}
+	// 2. Is it a real, fully locked escrow? If not, refuse it outright. This
+	// runs for every apply == true bid AND for an economy-clean apply == false
+	// bid, and it MUST finish before the void/refuse commit on the write path:
+	// a bid with a fabricated escrow is refused by NAME, never recorded as a
+	// void with its proofs burned into UsedY.
 	wallet := strings.ToLower(b.Wallet)
 	if !isPubHex(wallet) {
 		return errors.New("wallet pubkey invalid")
@@ -755,53 +828,16 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if err := verifySigAllBidTemplates(au, &b, s.Params); err != nil {
 		return err
 	}
-	// 2. Is it economically admissible? A bid's Amount is a DELTA added to the
-	// bidder's POSITION, never a resulting total (app doctrine:
-	// ui/auction/arena/bid-rules.ts:155-165; the escrow IS this delta, see the
-	// proof-sum check above). The top is the leader's position, and every other
-	// bidder's position on this lot is ZERO: their earlier legs were outbid and
-	// are refundable, so the money they still hold here is nothing (plan §2.1).
-	//
-	// That makes the floor a POSITION floor -- the resulting position
-	// own+Amount must reach top+minIncrement -- and it makes a leader's own
-	// raise legal (R2-A): with additive deltas every positive Amount strictly
-	// raises the top, so no rule needs to forbid it. The old "you are already
-	// the highest bidder" case is therefore DELETED, not relaxed.
-	//
-	// INVARIANT (asserted in tests, and the chain's form of ADR-0003 S4.9):
-	// after any accepted bid au.HighAmount == Σ { bid.Amount : bid.Status ==
-	// "leading" } and, after close, == Σ { bid.Amount : bid.Status == "won" }.
-	own := int64(0)
-	if au.HighBid != "" && s.Bids[au.HighBid].Bidder == ev.Pubkey {
-		own = au.HighAmount // the leader's position IS the top
-	}
-	min := au.StartPrice // a first bid's position must reach the opening price
-	if au.HighBid != "" {
-		min = au.HighAmount + au.MinIncrement
-		if own > 0 {
-			min = own // the leader improving their own standing need only reach the top
-		}
-	}
-	var late error
-	switch {
-	case au.Status != "open" || (timed && now >= au.EndAt):
-		late = &lateBid{"auction closed"}
-	case ev.Pubkey == au.Seller:
-		late = &lateBid{"seller cannot bid on own lot"}
-	case b.Amount > math.MaxInt64-own:
-		// Byzantine guard: Amount is bounded by the proof-sum check above, but
-		// own accumulates over the leader's legs, so the SUM must not wrap.
-		return errors.New("position overflows")
-	case own+b.Amount < min:
-		late = &lateBid{fmt.Sprintf("bid must add at least %d sats: your position would reach %d, the floor is %d",
-			min-own, own+b.Amount, min)}
-	}
-	if late != nil && len(au.Voids) >= maxVoids {
-		return errors.New(late.Error() + " (late-bid limit reached for this lot)")
-	}
 	if !apply {
+		// Economy-clean CheckTx bid: the escrow just verified, but nothing may
+		// be written at admission (late is nil here, so this returns nil and
+		// CheckTx admits it for delivery to decide).
 		return late
 	}
+	// From here the bid has cleared BOTH halves: the economy (step 1) and the
+	// escrow (step 2). Only now may it be recorded -- and only now is `late`
+	// resolved into a committed void, so a cheap-bad bid with a fabricated
+	// escrow was refused above and never reaches this line.
 	bid := &Bid{ID: ev.ID, Auction: au.ID, Bidder: ev.Pubkey, Name: b.Name, Wallet: wallet, Amount: b.Amount,
 		Proofs: b.Proofs, Locktime: lt, Height: height, Time: now, Status: "leading",
 		OutcomeTemplates: b.OutcomeTemplates}
@@ -938,12 +974,14 @@ func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckT
 			return &abci.CheckTxResponse{Code: 0, Log: "will be decided at delivery: " + err.Error()}, nil
 		}
 	case KindBid:
-		// The BID branch leaves the cryptography where it is and decides the
-		// ECONOMY here (R3). applyBid still verifies the whole escrow (DLEQ per
-		// proof, one shared SIG_ALL lock, the bidder's two pre-signed outcome
-		// templates) before it looks at the floor, so an unverified bid is
-		// still refused outright; what changes is what happens to a bid that is
-		// verified but LATE on arrival.
+		// The BID branch decides the ECONOMY here (R3), and decides it FIRST:
+		// applyBid runs the cheap arithmetic (auction open? seller? position
+		// floor? overflow?) before any cryptography, so a bid that is late on
+		// arrival is refused without paying for a single DLEQ or SIG_ALL. Only
+		// when the economy passes does applyBid then verify the whole escrow
+		// (DLEQ per proof, one shared SIG_ALL lock, the bidder's two pre-signed
+		// outcome templates) -- so an unverified bid is still refused outright;
+		// what changes is what happens to a bid that is verified but LATE.
 		//
 		// A bid that is late NOW can never become valid: the position floor
 		// only rises, a closed lot stays closed, and the seller never changes.

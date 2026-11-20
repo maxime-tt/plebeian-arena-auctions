@@ -729,14 +729,30 @@ func TestRefusedCreatePublishesKind1450(t *testing.T) {
 	}
 }
 
-// 4. The BID branch stays strict: a bid whose escrow proof comes from an
-// unpinned keyset is still refused by CheckTx with Code 2.
+// 4. The BID branch stays strict: a bid that clears the economy but carries an
+// escrow proof from an unpinned keyset is still refused by CheckTx with Code 2
+// and the ESCROW reason. applyBid decides the economy first, but a bid it
+// passes is not admitted cheaply -- the escrow is verified before CheckTx
+// admits it.
 func TestCheckTxStillRefusesAnUnverifiedBid(t *testing.T) {
 	a, _, coord := liveApp(t)
 	au := a.st.Auctions[coord]
 	alice := newBidder(t)
-	b, _ := json.Marshal(BidContent{Auction: au.ID, Amount: 1, Wallet: alice.wallet, Name: "t",
-		Proofs: []Proof{{ID: "unpinned-keyset", Amount: 1, Secret: "s", C: "c"}}})
+	unpinned := []Proof{{ID: "unpinned-keyset", Amount: 1, Secret: "s", C: "c"}}
+
+	// A bid that is BOTH economically late (below the opening price) and
+	// escrow-bad is refused by the economy short-circuit, before any escrow
+	// work: code stays 2, the reason is the economy's.
+	late, _ := json.Marshal(BidContent{Auction: au.ID, Amount: 1, Wallet: alice.wallet, Name: "t", Proofs: unpinned})
+	lateEv := signEventTags(t, alice.sk, KindBid, string(late), tNow, [][]string{{"e", au.RootID}, {"a", au.ID}})
+	lateTx, _ := json.Marshal(lateEv)
+	if ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: lateTx}); ck.Code != 2 || !strings.Contains(ck.Log, "bid must add at least") {
+		t.Fatalf("a late, unverified bid must be refused for the economy: %d %q", ck.Code, ck.Log)
+	}
+
+	// A bid that CLEARS the economy reaches the escrow check and is refused
+	// there, by name: admission never admits an unverified bid.
+	b, _ := json.Marshal(BidContent{Auction: au.ID, Amount: au.StartPrice, Wallet: alice.wallet, Name: "t", Proofs: unpinned})
 	ev := signEventTags(t, alice.sk, KindBid, string(b), tNow, [][]string{{"e", au.RootID}, {"a", au.ID}})
 	tx, _ := json.Marshal(ev)
 	ck, err := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx})
