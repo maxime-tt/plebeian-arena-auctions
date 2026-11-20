@@ -3,12 +3,14 @@ package main
 // The additive rebid chain (R1-A, R2-A, R3, R4).
 //
 // A bid's Amount is a DELTA added to the bidder's POSITION; the floor compares
-// the resulting position against top + minIncrement; a leader may raise their
-// own position (R2-A); the lead changing hands outbids EVERY leg of the
-// defeated chain; close promotes every leading leg of the winner; settlement
-// walks every won leg (one SIG_ALL swap per leg); a bid that is economically
-// late on arrival is REFUSED at admission (R3) and never recorded; and the
-// chain publishes the per-bid ADMISSION fact with its resulting position (R4).
+// the resulting position against top + the raise the top demands (2% of the
+// top, rounded up, at least 1 sat); a leader raising their own position must
+// also cover that raise (the old R2-A exemption is gone); the lead changing
+// hands outbids EVERY leg of the defeated chain; close promotes every leading
+// leg of the winner; settlement walks every won leg (one SIG_ALL swap per
+// leg); a bid that is economically late on arrival is REFUSED at admission
+// (R3) and never recorded; and the chain publishes the per-bid ADMISSION fact
+// with its resulting position (R4).
 //
 // The invariant these tests pin, in the chain's own words (ADR-0003 S4.9):
 // after any accepted bid, HighAmount == Σ { bid.Amount : bid.Status ==
@@ -49,10 +51,11 @@ func mustBid(t *testing.T, a *App, tx []byte, h, at int64) {
 	}
 }
 
-// --- R2-A: a leader may raise their own position --------------------------
+// --- a leader may raise, but must cover the 2% raise ----------------------
 
-// 1. The case the chain refused before R2-A: the leader's own rebid is legal,
-// both legs stay leading, and the position is the SUM of the deltas.
+// 1. The leader's own rebid is legal -- both legs stay leading and the position
+// is the SUM of the deltas -- but the rebid must cover the 2% raise, which on a
+// top of 500 is exactly the 10 sats bid here.
 func TestLeaderRebidIsAccepted(t *testing.T) {
 	a, m, id := liveApp(t)
 	alice := newBidder(t)
@@ -80,17 +83,25 @@ func TestLeaderRebidIsAccepted(t *testing.T) {
 	}
 }
 
-// 2. The ladder's Next delta for the leader is 1 sat; it must be admitted, or
-// the app's own button is a lie.
-func TestLeaderRebidOfOneSatIsAccepted(t *testing.T) {
+// 2. The minimum raise is now 2% of the top, not the ladder's static Next: on
+// a top of 500 the raise is 10 sats, so a 1-sat SELF-raise is REFUSED (the old
+// R2-A leader exemption is gone) while a raise of exactly 10 is accepted.
+func TestLeaderRebidOfOneSatIsRefused(t *testing.T) {
 	a, m, id := liveApp(t)
 	alice := newBidder(t)
 	_, tx1 := m.bidTx(t, a, alice, id, 500, "aa")
-	_, tx2 := m.bidTx(t, a, alice, id, 1, "bb")
 	mustBid(t, a, tx1, 11, tNow+1)
-	mustBid(t, a, tx2, 12, tNow+2)
-	if au := a.st.Auctions[id]; au.HighAmount != 501 {
-		t.Fatalf("position = %d, want 501", au.HighAmount)
+
+	_, txShort := m.bidTx(t, a, alice, id, 1, "bb")
+	ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: txShort})
+	if ck.Code != 2 || !strings.Contains(ck.Log, "bid must add at least 10 sats") {
+		t.Fatalf("a 1-sat self-raise must be refused (the raise is 2%% of the top, 10 sats): %d %q", ck.Code, ck.Log)
+	}
+
+	_, txRaise := m.bidTx(t, a, alice, id, 10, "cc")
+	mustBid(t, a, txRaise, 13, tNow+3)
+	if au := a.st.Auctions[id]; au.HighAmount != 510 {
+		t.Fatalf("position = %d, want 510", au.HighAmount)
 	}
 }
 
@@ -115,26 +126,73 @@ func TestHighAmountIsPositionNotDelta(t *testing.T) {
 	}
 }
 
-// 4. A challenger's delta that REACHES the position floor is admitted; their
-// position is that delta, not a total.
+// 4. A challenger's position floor is the top plus the 2% raise: on a top of
+// 1,000 that is 20, so a delta of 1,020 is admitted, 1,019 is refused, and the
+// position is the delta, not a total.
 func TestPositionFloorAdmitsReachingDelta(t *testing.T) {
 	a, m, id := liveApp(t)
 	alice, bob := newBidder(t), newBidder(t)
-	ev1, tx1 := m.bidTx(t, a, alice, id, 200, "aa")
-	ev2, tx2 := m.bidTx(t, a, bob, id, 210, "bb")
-	mustBid(t, a, tx1, 11, tNow+1)
-	mustBid(t, a, tx2, 12, tNow+2) // 200 + the 10 increment
+	ev1, tx1 := m.bidTx(t, a, alice, id, 1000, "aa")
+	mustBid(t, a, tx1, 11, tNow+1) // top 1,000: the raise is 20, the floor 1,020
+
+	_, txShort := m.bidTx(t, a, bob, id, 1019, "bb")
+	ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: txShort})
+	if ck.Code != 2 || !strings.Contains(ck.Log, "bid must add at least 1020 sats") {
+		t.Fatalf("a challenger's 1,019 must be refused (the floor is 1,000 + 20): %d %q", ck.Code, ck.Log)
+	}
+	ev2, tx2 := m.bidTx(t, a, bob, id, 1020, "cc")
+	mustBid(t, a, tx2, 12, tNow+2)
 
 	au := a.st.Auctions[id]
-	if au.HighBid != ev2.ID || au.HighAmount != 210 {
-		t.Fatalf("high = %s/%d, want %s/210", au.HighBid, au.HighAmount, ev2.ID)
+	if au.HighBid != ev2.ID || au.HighAmount != 1020 {
+		t.Fatalf("high = %s/%d, want %s/1020", au.HighBid, au.HighAmount, ev2.ID)
 	}
 	if a.st.Bids[ev2.ID].Status != "leading" || a.st.Bids[ev1.ID].Status != "outbid" {
 		t.Fatalf("the challenger leads and the defeated leg is outbid: %q/%q",
 			a.st.Bids[ev2.ID].Status, a.st.Bids[ev1.ID].Status)
 	}
-	if got := bidSum(a.st, id, "leading"); got != 210 {
-		t.Fatalf("Σ leading legs = %d, want just the challenger's 210", got)
+	if got := bidSum(a.st, id, "leading"); got != 1020 {
+		t.Fatalf("Σ leading legs = %d, want just the challenger's 1020", got)
+	}
+}
+
+// 4b. The raise is 2% of the top, ROUNDED UP: for a small top and a large top,
+// inc-1 sats is refused (naming the required delta, the position it would
+// reach, and the floor) and exactly inc sats is accepted.
+func TestRaiseIsTwoPercentOfTopRoundedUp(t *testing.T) {
+	cases := []struct {
+		name string
+		top  int64
+		inc  int64 // ceil(top * 2 / 100)
+	}{
+		{"small top rounds up", 101, 3}, // 2.02% -> 3
+		{"large top", 10_000, 200},      // exactly 2%
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, m, id := liveApp(t)
+			alice := newBidder(t)
+			_, tx := m.bidTx(t, a, alice, id, tc.top, "aa")
+			mustBid(t, a, tx, 11, tNow+1)
+
+			_, short := m.bidTx(t, a, alice, id, tc.inc-1, "bb")
+			ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: short})
+			if ck.Code != 2 {
+				t.Fatalf("a raise of %d (one below the %d raise) must be refused, got code %d (%q)",
+					tc.inc-1, tc.inc, ck.Code, ck.Log)
+			}
+			want := fmt.Sprintf("bid must add at least %d sats: your position would reach %d, the floor is %d",
+				tc.inc, tc.top+tc.inc-1, tc.top+tc.inc)
+			if ck.Log != want {
+				t.Fatalf("refusal = %q, want %q", ck.Log, want)
+			}
+
+			_, exact := m.bidTx(t, a, alice, id, tc.inc, "cc")
+			mustBid(t, a, exact, 12, tNow+2)
+			if au := a.st.Auctions[id]; au.HighAmount != tc.top+tc.inc {
+				t.Fatalf("position = %d, want %d", au.HighAmount, tc.top+tc.inc)
+			}
+		})
 	}
 }
 
@@ -179,7 +237,7 @@ func TestLeaderRaiseKeepsExistingLegsLeading(t *testing.T) {
 	alice, bob := newBidder(t), newBidder(t)
 	ev1, tx1 := m.bidTx(t, a, alice, id, 500, "aa")
 	ev2, tx2 := m.bidTx(t, a, alice, id, 10, "bb")
-	_, tx3 := m.bidTx(t, a, bob, id, 520, "cc")
+	_, tx3 := m.bidTx(t, a, bob, id, 521, "cc") // top 510 + the 11-sat raise (2% of 510, rounded up)
 	mustBid(t, a, tx1, 11, tNow+1)
 	mustBid(t, a, tx2, 12, tNow+2)
 	if due := a.st.dueMoves(tNow + 3); len(due) != 0 {
@@ -231,12 +289,13 @@ func TestCloseDoesNotPromoteRefundedLegs(t *testing.T) {
 	evB, txB := m.bidTx(t, a, bob, id, 520, "bb")
 	mustBid(t, a, txA, 11, tNow+1)
 	mustBid(t, a, txB, 12, tNow+2)
-	// Alice's 500 is outbid and is refunded before she re-enters below the floor.
+	// Alice's 500 is outbid and is refunded before she re-enters below the floor
+	// (Bob's 520 demands a 2% raise of ceil(520*2/100) = 11, so the floor is 531).
 	refund := mintMove(t, a, m, evA.ID, "refund", alice.wallet, tNow+3)
 	finalize(t, a, 13, tNow+3, makeSettle(refund))
 	evLate, txLate := m.bidTx(t, a, alice, id, 30, "cc")
 	res := finalize(t, a, 14, tNow+4, txLate)
-	if !strings.HasPrefix(res.TxResults[0].Log, "void: bid must add at least 530") {
+	if !strings.HasPrefix(res.TxResults[0].Log, "void: bid must add at least 531") {
 		t.Fatalf("the below-floor re-entry must be void at delivery: %q", res.TxResults[0].Log)
 	}
 	finalize(t, a, 15, tNow+101) // close
@@ -265,7 +324,7 @@ func TestMultiLegWinnerSettlesEveryLeg(t *testing.T) {
 	_, tx1 := m.bidTx(t, a, alice, id, 300, "a1")
 	_, tx2 := m.bidTx(t, a, alice, id, 200, "a2")
 	evB, txB := m.bidTx(t, a, bob, id, 510, "bb")
-	ev1, tx3 := m.bidTx(t, a, alice, id, 520, "a3")
+	ev1, tx3 := m.bidTx(t, a, alice, id, 521, "a3") // 510 + the 11-sat raise (2% of 510, rounded up)
 	ev2, tx4 := m.bidTx(t, a, alice, id, 20, "a4")
 	mustBid(t, a, tx1, 11, tNow+1)
 	mustBid(t, a, tx2, 12, tNow+2)
@@ -275,8 +334,8 @@ func TestMultiLegWinnerSettlesEveryLeg(t *testing.T) {
 	finalize(t, a, 16, tNow+101) // close
 
 	au := a.st.Auctions[id]
-	if au.HighAmount != 540 || bidSum(a.st, id, "won") != 540 {
-		t.Fatalf("the winning position is 520+20=540: got HighAmount %d, Σ won %d",
+	if au.HighAmount != 541 || bidSum(a.st, id, "won") != 541 {
+		t.Fatalf("the winning position is 521+20=541: got HighAmount %d, Σ won %d",
 			au.HighAmount, bidSum(a.st, id, "won"))
 	}
 	if a.st.Bids[evB.ID].Status != "lost" {
@@ -451,7 +510,10 @@ func TestV4VMultiLegSettlementSumsToPosition(t *testing.T) {
 	}
 
 	// A delta below the split's representability floor is REFUSED AT ADMISSION
-	// (not void): floor(4*2500/10000) = 1 here, so use a row that rounds to 0.
+	// (not void).  The raise rule is a Params term now, so pin it to its 1-sat
+	// minimum (1 bp of the top) and the 3-sat leg clears the floor; but
+	// floor(3*2500/10000) = 0, so the committed split cannot represent it.
+	a.st.Params.MinIncrementBps = 1
 	ev3, _ := v4vBid(t, a, m, alice, id, 3, "cc", nil, nil) // floor(3*0.25) = 0
 	err := a.st.applyBid(ev3, tNow, 18, true, true)
 	var late *lateBid
@@ -584,7 +646,7 @@ func TestBelowFloorBidIsRefusedAtAdmission(t *testing.T) {
 	a, m, id := liveApp(t)
 	alice, bob := newBidder(t), newBidder(t)
 	ev1, tx1 := m.bidTx(t, a, alice, id, 200, "aa")
-	mustBid(t, a, tx1, 11, tNow+1) // Alice leads: the floor for a challenger is 210
+	mustBid(t, a, tx1, 11, tNow+1) // Alice leads with 200: the 2% raise is 4, so a challenger's floor is 204
 	usedBefore := len(a.st.UsedY)
 
 	ev2, tx2 := m.bidTx(t, a, bob, id, 150, "bb")
@@ -592,8 +654,8 @@ func TestBelowFloorBidIsRefusedAtAdmission(t *testing.T) {
 	if ck.Code != 2 {
 		t.Fatalf("a below-floor bid must be REFUSED at admission, got code %d (%q)", ck.Code, ck.Log)
 	}
-	if !strings.HasPrefix(ck.Log, "bid must add at least 210") ||
-		!strings.Contains(ck.Log, "the floor is 210") {
+	if !strings.HasPrefix(ck.Log, "bid must add at least 204") ||
+		!strings.Contains(ck.Log, "the floor is 204") {
 		t.Fatalf("the refusal must state the required delta and the floor: %q", ck.Log)
 	}
 
@@ -625,13 +687,13 @@ func TestBelowFloorBidIsRefusedAtAdmission(t *testing.T) {
 
 	// A delta that reaches the floor IS admitted, and the challenger takes the
 	// lead with the position that delta creates.
-	ev3, tx3 := m.bidTx(t, a, bob, id, 210, "cc")
+	ev3, tx3 := m.bidTx(t, a, bob, id, 204, "cc")
 	if ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: tx3}); ck.Code != 0 {
 		t.Fatalf("a reaching delta must be admitted: %d %q", ck.Code, ck.Log)
 	}
 	mustBid(t, a, tx3, 12, tNow+2)
-	if au := a.st.Auctions[id]; au.HighBid != ev3.ID || au.HighAmount != 210 || au.HighBid != a.st.Bids[ev3.ID].ID {
-		t.Fatalf("the challenger must lead with 210: %+v", au)
+	if au := a.st.Auctions[id]; au.HighBid != ev3.ID || au.HighAmount != 204 || au.HighBid != a.st.Bids[ev3.ID].ID {
+		t.Fatalf("the challenger must lead with 204: %+v", au)
 	}
 }
 

@@ -45,6 +45,15 @@ type Params struct {
 	MaxDurationSec int64 `json:"maxDurationSec"`
 	MaxProofs      int   `json:"maxProofs"`
 	Threshold      int   `json:"threshold"`
+	// MinIncrementBps is the minimum raise a bid must add over the current top,
+	// in BASIS POINTS of that top: the admission rule is
+	// max(1 sat, ceil(HighAmount * MinIncrementBps / 10000)).  It lives in
+	// Params, so it rides in the app hash and the publisher carries it in the
+	// kind-1448 params event for the app to read live.  0 means unset, and the
+	// chain then uses DefaultMinIncrementBps (200 = 2%); omitempty keeps an
+	// unset value out of the encoding, so existing state re-encodes and hashes
+	// byte-identically.
+	MinIncrementBps int64 `json:"minIncrementBps,omitempty"`
 	// Validators is the verdict-publish roster (spec §9, REPLY §3.4): each
 	// validator's own Nostr pubkey, moniker and index.  It lives in Params, so
 	// it is inside the AppHash -- a state commitment (kind 1447) commits to the
@@ -52,6 +61,22 @@ type Params struct {
 	// verification in this increment.  A verdict is signed under the validator's
 	// OWN key from this list, never a shared publisher key.
 	Validators []ValidatorKey `json:"validators,omitempty"`
+}
+
+// DefaultMinIncrementBps is the raise rule the chain enforces when
+// Params.MinIncrementBps is unset (0): 200 basis points, i.e. 2% of the current
+// top.  It is a code default, not committed state -- but effectiveMinIncrementBps
+// resolves it before publication, so the kind-1448 params event always carries
+// the number the chain actually enforces.
+const DefaultMinIncrementBps int64 = 200
+
+// effectiveMinIncrementBps is the raise rule actually in force: the committed
+// Params value when it is set (positive), else the compiled default.
+func effectiveMinIncrementBps(p Params) int64 {
+	if p.MinIncrementBps > 0 {
+		return p.MinIncrementBps
+	}
+	return DefaultMinIncrementBps
 }
 
 type Auction struct {
@@ -79,6 +104,24 @@ type Auction struct {
 	Voids        []string `json:"voids,omitempty"` // late bids, refundable at once (ADR 0007)
 	ClosedAt     int64    `json:"closedAt"`
 	ClosedH      int64    `json:"closedHeight"`
+	// AcceptedH is the committed height at which the chain ACCEPTED this lot:
+	// the height the ROOT create was applied at. It is the lot's acceptance
+	// fact -- the anchor the chain publishes a kind-1449 arena.createadmit.v1
+	// event at, so a reader learns from the chain itself that this auction is
+	// being followed. It is set ONCE, in the root branch of applyCreate below,
+	// and a supersession NEVER moves it: an already-accepted lot stays accepted
+	// at its original height, however many times it is edited.
+	//
+	// omitempty is MANDATORY, not style, for exactly the reason the settle-when
+	// and lot-state fields below state: snapshot.go's load path refuses any
+	// state whose canonical encoding does not re-encode byte-identically, so a
+	// field without it would make every existing data/app-state/*.json
+	// unreadable and stop the live root restarting. It is zero on every lot
+	// already in state when this field first ships, so an old snapshot loads
+	// as-is; such a lot keeps AcceptedH == 0 forever (a supersession does not
+	// fill it in), and the publisher's legacy path handles it -- see
+	// verdictpublish.go's publishAccepts.
+	AcceptedH int64 `json:"acceptedH,omitempty"`
 	// Root pinning and supersession (owner decision 2026-11-12, spec §8). The
 	// auction's identity is (seller, d); the FIRST 1440 event for it is the
 	// root and its id is auction_root_event_id. Later 1440 events are
@@ -585,7 +628,7 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 			Title: c.Title, Description: c.Description, Image: c.Image, Category: c.Category,
 			StartPrice: c.StartPrice, MinIncrement: c.MinIncrement, CreatedAt: now, CreatedH: height,
 			EndAt: end, Mode: mode, WindowSec: c.WindowSec, Status: "open", Bids: []string{},
-			V4VSplit: split,
+			V4VSplit: split, AcceptedH: height,
 		}
 		s.Order = append(s.Order, coord)
 		return nil
@@ -612,7 +655,9 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 		return nil
 	}
 	// Only display fields change; money, time and cryptography stay put, and
-	// EndAt is never recomputed.
+	// EndAt is never recomputed.  AcceptedH is deliberately NOT in this list:
+	// an already-accepted lot stays accepted at its original height, and the
+	// createadmit fact's anchor never moves for it.
 	cur.Title, cur.Description, cur.Image, cur.Category, cur.SellerName = c.Title, c.Description, c.Image, c.Category, c.Name
 	cur.VersionID, cur.VersionCreatedAt, cur.CreatedH = ev.ID, ev.CreatedAt, height
 	return nil
@@ -722,10 +767,16 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	// still hold here is nothing (plan §2.1).
 	//
 	// That makes the floor a POSITION floor -- the resulting position
-	// own+Amount must reach top+minIncrement -- and it makes a leader's own
-	// raise legal (R2-A): with additive deltas every positive Amount strictly
-	// raises the top, so no rule needs to forbid it. The old "you are already
-	// the highest bidder" case is therefore DELETED, not relaxed.
+	// own+Amount must reach top + the RAISE the top demands. The raise is the
+	// effective increment in basis points of the top, rounded up, never less
+	// than 1 sat (maintainer's ruling: "minimum increment becomes 2% of the
+	// highest bid", the default 200 bps); the bps live in Params, so they ride
+	// in the app hash and the kind-1448 params event carries them to the app.
+	// This REPLACES Params.MinIncrement/Auction.MinIncrement for the raise:
+	// those survive only as the create-side/instance minimum (the kind-1440
+	// field).  A leader raising their own position obeys the SAME rule -- the
+	// old R2-A "own beats the floor" exemption is DELETED, so the extra Amount
+	// must itself cover the raise and a 1-sat self-raise can no longer exist.
 	//
 	// INVARIANT (asserted in tests, and the chain's form of ADR-0003 S4.9):
 	// after any accepted bid au.HighAmount == Σ { bid.Amount : bid.Status ==
@@ -736,10 +787,30 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	}
 	min := au.StartPrice // a first bid's position must reach the opening price
 	if au.HighBid != "" {
-		min = au.HighAmount + au.MinIncrement
-		if own > 0 {
-			min = own // the leader improving their own standing need only reach the top
+		// inc = max(1, ceil(HighAmount * bps / 10000)), the raise in the
+		// effective basis points: a top of 1,000 at 200 bps asks for 20, a top
+		// of 50 asks for 1.  The product is guarded against overflow; a top of
+		// 0 cannot come from a committed bid (every proof amount is positive)
+		// but the max(1, …) floor keeps the rule total.
+		bps := effectiveMinIncrementBps(s.Params)
+		inc := int64(1)
+		if au.HighAmount > 0 {
+			if au.HighAmount > math.MaxInt64/bps {
+				// A top so large that HighAmount*bps would wrap: the raise is
+				// then far past any real supply, so saturate rather than wrap.
+				inc = math.MaxInt64/10000 + 1
+			} else {
+				p := au.HighAmount * bps
+				inc = p / 10000
+				if p%10000 != 0 {
+					inc++
+				}
+			}
 		}
+		if inc < 1 {
+			inc = 1
+		}
+		min = au.HighAmount + inc
 	}
 	var late error
 	switch {

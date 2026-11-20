@@ -297,15 +297,21 @@ type ParamsContent struct {
 	// SettlementSafetySec is how long after the end a bid itself establishes
 	// the settlement must land; BidToConsensusLatencySec covers the bidder's
 	// clock to the admitting block (spec §2.1).
-	SettlementSafetySec      int64          `json:"settlement_safety_sec"`
-	BidToConsensusLatencySec int64          `json:"bid_to_consensus_latency_sec"`
-	MinWindowSec             int64          `json:"min_window_sec"`
-	MaxWindowSec             int64          `json:"max_window_sec"`
-	MinDurationSec           int64          `json:"min_duration_sec"`
-	MaxDurationSec           int64          `json:"max_duration_sec"`
-	MaxProofs                int            `json:"max_proofs"`
-	Threshold                int            `json:"threshold"`
-	Validators               []ValidatorKey `json:"validators"`
+	SettlementSafetySec      int64 `json:"settlement_safety_sec"`
+	BidToConsensusLatencySec int64 `json:"bid_to_consensus_latency_sec"`
+	// MinIncrementBps is the minimum raise over the current top, in basis
+	// points of that top: admission requires max(1 sat, ceil(top * bps /
+	// 10000)).  It is a committed term (it rides in the app hash with Params),
+	// published here as the EFFECTIVE value, so a client reads 200 for the
+	// default rather than the 0 that means "unset" inside Params.
+	MinIncrementBps int64          `json:"min_increment_bps"`
+	MinWindowSec    int64          `json:"min_window_sec"`
+	MaxWindowSec    int64          `json:"max_window_sec"`
+	MinDurationSec  int64          `json:"min_duration_sec"`
+	MaxDurationSec  int64          `json:"max_duration_sec"`
+	MaxProofs       int            `json:"max_proofs"`
+	Threshold       int            `json:"threshold"`
+	Validators      []ValidatorKey `json:"validators"`
 
 	// The create-content rules below are CODE, not committed terms: they are
 	// the limits applyCreate enforces on every kind-1440 create, published
@@ -597,7 +603,8 @@ func BuildParamsEvent(sk *btcec.PrivateKey, p Params, height int64, appHashHex s
 		Schema: ParamsSchema, Height: height, AppHash: appHashHex, ParamsVersion: paramsVersion(p),
 		GroupKey: p.GroupKey, MintURL: p.MintURL, KeysetID: p.KeysetID, Keys: p.Keys,
 		SettlementSafetySec: p.SettlementSafetySec, BidToConsensusLatencySec: p.BidToConsensusLatencySec,
-		MinWindowSec: p.MinWindowSec, MaxWindowSec: p.MaxWindowSec,
+		MinIncrementBps: effectiveMinIncrementBps(p),
+		MinWindowSec:    p.MinWindowSec, MaxWindowSec: p.MaxWindowSec,
 		MinDurationSec: p.MinDurationSec, MaxDurationSec: p.MaxDurationSec,
 		MaxProofs: p.MaxProofs, Threshold: p.Threshold, Validators: p.Validators,
 		// From createrules.go: the same constants applyCreate enforces, never a

@@ -1,7 +1,7 @@
 package main
 
 // The publish driver.  It reads the validator's COMMITTED snapshot and writes
-// seven event classes back to the relay:
+// eight event classes back to the relay:
 //
 //   - a state pulse (kind 21447, EPHEMERAL) on EVERY pass, so a live subscriber
 //     can place the chain's clock even while nothing happens.  A pulse the
@@ -23,6 +23,10 @@ package main
 //   - the lot's committed END (kind 1449, STORED) for each bid that extended a
 //     lot, anchored at THAT bid's height, and once for each closed lot, anchored
 //     at ClosedH -- so a late reader learns where the lot ended;
+//   - the chain's ACCEPTANCE of each lot it follows (kind 1449, STORED, schema
+//     arena.createadmit.v1) for each auction the chain has committed, anchored
+//     at the lot's ACCEPTED height -- so a reader learns from the chain itself
+//     which auctions are being followed, instead of inferring it from silence;
 //   - the chain's own refusal (kind 1450, STORED) for each committed rejection
 //     of a create or bid, carrying the reason VERBATIM and anchored at the
 //     rejecting block's height.
@@ -66,7 +70,7 @@ import (
 // ordering on it: every verdict record carries the committed height it acted
 // at, so "published after commit" is checkable rather than merely claimed.
 type PublishRecord struct {
-	Op              string // "state_commitment" | "state_pulse" | "params" | "verdict" | "receipt" | "lot" | "refusal" | "refused"
+	Op              string // "state_commitment" | "state_pulse" | "params" | "verdict" | "receipt" | "lot" | "bid_admit" | "create_admit" | "refusal" | "refused"
 	CommittedHeight int64  // the app's committed height when Step ran
 	Height          int64  // the anchor height on the event
 	Hash            string // the anchor hash on the event
@@ -123,6 +127,7 @@ type Publisher struct {
 	receipted        map[string]bool // bidID + "|" + outcome -> a receipt has been published (or can never be)
 	lots             map[string]bool // auctionID + "|" + end_time -> a lot event has been published
 	admits           map[string]bool // bid id -> that bid's admission fact has been published (R4)
+	accepts          map[string]bool // auction id -> that lot's create-admission fact has been published
 	refusals         map[string]bool // event id + "|" + reason -> a refusal event has been published
 	lastCommitHeight int64           // committed height of the last commitment published
 	lastCommitTime   int64           // unix seconds (p.now) of the last commitment published
@@ -168,6 +173,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		receipted: map[string]bool{},
 		lots:      map[string]bool{},
 		admits:    map[string]bool{},
+		accepts:   map[string]bool{},
 		refusals:  map[string]bool{},
 	}, nil
 }
@@ -209,15 +215,16 @@ func (p *Publisher) Step(ctx context.Context) {
 	}
 	state.Height, state.Time = height, blockTime
 
-	// 1. Verdicts, receipts, lot state and refusals first: each one is a
-	//    "meaningful change", and each result joins the commitment gate below.
-	//    All four run on every pass; none may be skipped just because another
-	//    published something.
+	// 1. Verdicts, receipts, lot state, acceptances and refusals first: each
+	//    one is a "meaningful change", and each result joins the commitment
+	//    gate below.  All five run on every pass; none may be skipped just
+	//    because another published something.
 	publishedVerdict := p.publishVerdicts(ctx, state, height)
 	publishedReceipt := p.publishReceipts(ctx, state, height)
 	publishedLots := p.publishLots(ctx, state, height)
+	publishedAccepts := p.publishAccepts(ctx, state, height)
 	publishedRefusals := p.publishRefusals(ctx, state, height)
-	publishedClaim := publishedVerdict || publishedReceipt || publishedLots || publishedRefusals
+	publishedClaim := publishedVerdict || publishedReceipt || publishedLots || publishedAccepts || publishedRefusals
 
 	appHashHex := hexOrEmpty(appHash)
 	now := p.now()
@@ -678,6 +685,98 @@ func (p *Publisher) publishLots(ctx context.Context, state *State, height int64)
 		}
 		p.mu.Lock()
 		p.lots[key] = true
+		p.mu.Unlock()
+		p.record(rec)
+		any = true
+	}
+	return any
+}
+
+// publishAccepts publishes the chain's ACCEPTANCE of each lot it follows (kind
+// 1449, schema arena.createadmit.v1), anchored at the height the root create was
+// committed.  It is the positive counterpart of a refusal: instead of a reader
+// inferring which auctions count from the absence of a refusal, the chain states
+// it, so at any point every validator knows which auctions are going on.  This is
+// the fact a later fee announcement or a max-concurrent-lots bound hangs off
+// (maintainer's requirement).
+//
+// The anchor is the lot's OWN accepted height -- Auction.AcceptedH, which
+// applyCreate sets once at the root and a supersession never moves -- so the fact
+// is stable for the life of an accepted lot however many times it is edited.
+// Dedupe is per validator by auction id, and an event is marked only AFTER a
+// successful relay publish, so a transient relay failure retries.  If the anchor
+// block's hash is not readable yet, nothing is published: the refusal is recorded
+// and retried next pass -- a claim the chain cannot anchor is not published.
+//
+// LEGACY LOTS.  A lot already in state when AcceptedH first shipped has
+// AcceptedH == 0: it was accepted before the chain began recording the height.
+// Those, and only those, anchor at the lot's current CreatedH, so the deploy does
+// not silently orphan every lot the chain has been running.  The consequence,
+// stated so nobody is surprised: a legacy lot SUPERSEDED between two validator
+// restarts re-emits its acceptance at a moved anchor, because a supersession
+// updates CreatedH.  The two events are identical in content -- the anchor is the
+// only difference -- and a client dedupes at the earliest anchored height; a lot
+// created after this change always has AcceptedH > 0 and never moves.
+func (p *Publisher) publishAccepts(ctx context.Context, state *State, height int64) bool {
+	ids := make([]string, 0, len(state.Auctions))
+	for id := range state.Auctions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // deterministic order across validators
+
+	any := false
+	for _, id := range ids {
+		au := state.Auctions[id]
+		if au == nil {
+			continue
+		}
+		p.mu.Lock()
+		done := p.accepts[au.ID]
+		p.mu.Unlock()
+		if done {
+			continue
+		}
+		anchor := au.AcceptedH
+		if anchor <= 0 {
+			// Legacy lot (see the comment above): accepted before AcceptedH
+			// existed, so its current CreatedH is the best anchor it has.
+			anchor = au.CreatedH
+		}
+		if anchor <= 0 {
+			// No committed height at all to anchor to.  Do NOT mark it: a
+			// supersession updates CreatedH, so this can become publishable; a
+			// permanent mark would suppress a legitimately acceptable lot.
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, AuctionID: au.ID,
+				Reason: "create_has_no_committed_height"})
+			continue
+		}
+		blockHash, ok := p.blockHash(anchor)
+		if !ok || blockHash == "" {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: anchor,
+				AuctionID: au.ID, Reason: "committed_block_hash_unknown"})
+			continue
+		}
+		ac := CreateAdmitContent{
+			AuctionID: au.ID, Seller: au.Seller, RootEventID: au.RootID,
+			AcceptedHeight: anchor, BlockHash: blockHash,
+			EndTime: au.EndAt, OriginalEndTime: au.OriginalEnd(), Mode: au.Mode,
+		}
+		ev, err := BuildCreateAdmitEvent(p.key, ac, p.now())
+		if err != nil {
+			p.record(PublishRecord{Op: "refused", CommittedHeight: height, Height: anchor,
+				AuctionID: au.ID, Reason: err.Error()})
+			continue
+		}
+		rec := PublishRecord{Op: "create_admit", CommittedHeight: height, Height: anchor,
+			Hash: blockHash, AuctionID: au.ID}
+		if err := p.relay.Publish(ctx, ev); err != nil {
+			// Do NOT mark it published: a transient relay failure retries.
+			rec.Error = err.Error()
+			p.record(rec)
+			continue
+		}
+		p.mu.Lock()
+		p.accepts[au.ID] = true
 		p.mu.Unlock()
 		p.record(rec)
 		any = true

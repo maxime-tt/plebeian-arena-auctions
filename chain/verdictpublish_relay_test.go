@@ -133,7 +133,7 @@ func TestVerdictPublishE2ERelayOnlyClientReconstructsOutcome(t *testing.T) {
 		t.Fatalf("dial reader: %v", err)
 	}
 	defer reader.Close()
-	events, cancelSub, err := reader.Subscribe(ctx, RelayFilter{Kinds: []int{KindCreate, KindBid, KindOutcome, KindStateCommit}})
+	events, cancelSub, err := reader.Subscribe(ctx, RelayFilter{Kinds: []int{KindCreate, KindBid, KindOutcome, KindStateCommit, KindLot}})
 	if err != nil {
 		t.Fatalf("subscribe reader: %v", err)
 	}
@@ -227,6 +227,39 @@ func TestVerdictPublishE2ERelayOnlyClientReconstructsOutcome(t *testing.T) {
 	waitForRelay(t, 10*time.Second, func() bool { return commitFor() != nil }, "a state commitment on the relay")
 	if _, err := ParseStateCommitment(commitFor(), roster); err != nil {
 		t.Fatalf("relayed state commitment must parse and roster-check: %v", err)
+	}
+
+	// The chain's ACCEPTANCE of the lot (kind 1449, schema arena.createadmit.v1)
+	// reaches the relay too.  A relay-only client learns from the chain itself
+	// that this auction is being followed, and the fact parses with the SAME
+	// schema string the publisher built it with -- so the build side and the
+	// parse side cannot drift.
+	acceptFor := func() *Event {
+		for _, e := range collected() {
+			if e.Kind != KindLot {
+				continue
+			}
+			if c, err := ParseCreateAdmitEvent(e, roster); err == nil && c.AuctionID == coord {
+				return e
+			}
+		}
+		return nil
+	}
+	waitForRelay(t, 10*time.Second, func() bool { return acceptFor() != nil },
+		"a create-acceptance on the relay")
+	acc, err := ParseCreateAdmitEvent(acceptFor(), roster)
+	if err != nil {
+		t.Fatalf("relayed create-acceptance must parse and roster-check: %v", err)
+	}
+	if acc.Seller != seller.pub || acc.RootEventID != createEv.ID {
+		t.Fatalf("relayed acceptance names the wrong lot: %+v (want seller %s root %s)", acc, seller.pub, createEv.ID)
+	}
+	if acc.AcceptedHeight != 1 || acc.BlockHash != testBlockHash(1) {
+		t.Fatalf("relayed acceptance anchor = %d/%s, want 1/%s (the height the create committed)",
+			acc.AcceptedHeight, acc.BlockHash, testBlockHash(1))
+	}
+	if acc.Mode != "fixed" || acc.OriginalEndTime != acc.EndTime {
+		t.Fatalf("relayed acceptance must carry the fixed lot's end: %+v", acc)
 	}
 
 	// RECONSTRUCT THE OUTCOME FROM THE RELAY ALONE.  Everything fed to

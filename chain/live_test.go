@@ -252,7 +252,7 @@ func TestLateBidIsVoidAndRefundable(t *testing.T) {
 	a, m, id := liveApp(t)
 	alice, bob := newBidder(t), newBidder(t)
 	ev1, tx1 := m.bidTx(t, a, alice, id, 200, "aa")
-	ev2, tx2 := m.bidTx(t, a, bob, id, 150, "bb") // below 200+10 once Alice commits
+	ev2, tx2 := m.bidTx(t, a, bob, id, 150, "bb") // below 200+4 once Alice commits (2% of 200)
 
 	// Both clear admission BEFORE either block lands: Bob's 150 beats the
 	// opening price (100), so this is a legitimate race, not a late bid.
@@ -264,13 +264,13 @@ func TestLateBidIsVoidAndRefundable(t *testing.T) {
 	if ck.Code != 0 || ck.Log != "" {
 		t.Fatalf("good bid: %d %q", ck.Code, ck.Log)
 	}
-	// One block, in this order: Alice's leg sets the floor at 210, then Bob's is
+	// One block, in this order: Alice's leg sets the floor at 204, then Bob's is
 	// decided against it and is void, refundable now.
 	res := finalize(t, a, 11, tNow+1, tx1, tx2)
 	if r := res.TxResults[0]; r.Code != 0 {
 		t.Fatalf("bid 1: %v", r.Log)
 	}
-	if r := res.TxResults[1]; r.Code != 0 || !strings.HasPrefix(r.Log, "void: bid must add at least 210") {
+	if r := res.TxResults[1]; r.Code != 0 || !strings.HasPrefix(r.Log, "void: bid must add at least 204") {
 		t.Fatalf("the overtaken bid must be void at delivery: %d %q", r.Code, r.Log)
 	}
 	au, b := a.st.Auctions[id], a.st.Bids[ev2.ID]
