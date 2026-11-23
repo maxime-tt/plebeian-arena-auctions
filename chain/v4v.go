@@ -186,27 +186,48 @@ type splitOut struct {
 // always paid to the seller. The outputs therefore sum to the bid amount
 // EXACTLY -- no sat is created or lost.
 //
+// Each recipient's share is then DECOMPOSED into the pinned keyset's
+// denominations (a 100-sat share becomes 4 + 32 + 64), because a Cashu output
+// must be a single mint denomination and a non-denomination output can never be
+// signed -- it would be admitted and then strand the escrow. Rows keep their
+// committed order, each row's parts ascending, and every part is paid to that
+// row's recipient.
+//
 // When the split allocates all 10000 bps and the floors happen to sum to the
 // whole bid, the remainder is 0 and NO seller output exists; otherwise a seller
-// output exists. A row whose floor is 0 sats cannot be a positive escrow output,
-// so the settle check refuses such a bid by name rather than paying the
-// recipient nothing.
-func splitSats(sellerWallet string, split []CommittedSplitRow, amount int64) []splitOut {
+// output (or outputs) exists. A share of 0 sats, or one the pinned keyset
+// cannot represent, is an error the callers refuse by name rather than paying
+// the recipient nothing.
+func splitSats(sellerWallet string, split []CommittedSplitRow, amount int64, keys map[string]string) ([]splitOut, error) {
 	seller := strings.ToLower(sellerWallet)
 	if len(split) == 0 {
-		return []splitOut{{Recipient: seller, Amount: amount}}
+		return []splitOut{{Recipient: seller, Amount: amount}}, nil
 	}
 	out := make([]splitOut, 0, len(split)+1)
 	var allocated int64
+	add := func(role, recipient string, share int64) error {
+		parts := splitAmount(share, keys)
+		if len(parts) == 0 {
+			return fmt.Errorf("the %s share of %d sats cannot be represented in the pinned keyset denominations", role, share)
+		}
+		for _, part := range parts {
+			out = append(out, splitOut{Recipient: recipient, Amount: part})
+		}
+		return nil
+	}
 	for _, row := range split {
 		share := amount * row.AllocationBps / v4vTotalBps
 		allocated += share
-		out = append(out, splitOut{Recipient: row.RecipientPubkey, Amount: share})
+		if err := add(row.Role, row.RecipientPubkey, share); err != nil {
+			return nil, err
+		}
 	}
 	if rem := amount - allocated; rem > 0 {
-		out = append(out, splitOut{Recipient: seller, Amount: rem})
+		if err := add("seller remainder", seller, rem); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }
 
 // isSplitRecipient reports whether pubkey is one of the committed split rows.
@@ -221,18 +242,22 @@ func isSplitRecipient(au *Auction, pubkey string) bool {
 }
 
 // settleMatchesSplit is the CONSENSUS check that a bid's pre-signed SETTLE
-// template pays EXACTLY the committed split, in order: one output per committed
-// row (same recipient, same amount) plus the seller remainder output when the
-// remainder is positive. It refuses, naming the rule, a template that omits a
-// row, adds an uncommitted output, reorders rows, reprices a row, names a
-// different keyset, or cannot represent a row without loss.
-func settleMatchesSplit(au *Auction, amount int64, template sigAllSignedTemplate, keysetID string) error {
+// template pays EXACTLY the committed split, in order: the committed rows'
+// shares decomposed into the pinned denominations (each row's parts ascending,
+// rows in committed order) plus the seller remainder's parts when the remainder
+// is positive. It refuses, naming the rule, a template that omits a row or a
+// denomination, adds an uncommitted output, reorders rows, reprices a row,
+// names a different keyset, or cannot represent a row without loss.
+func settleMatchesSplit(au *Auction, amount int64, template sigAllSignedTemplate, keysetID string, keys map[string]string) error {
 	for _, row := range au.V4VSplit {
 		if amount*row.AllocationBps/v4vTotalBps == 0 {
 			return fmt.Errorf("sigall settle template cannot represent the committed v4v split without loss: the %s row rounds to 0 sats at a %d sat bid", row.Role, amount)
 		}
 	}
-	expected := splitSats(au.SellerWallet, au.V4VSplit, amount)
+	expected, err := splitSats(au.SellerWallet, au.V4VSplit, amount, keys)
+	if err != nil {
+		return fmt.Errorf("sigall settle template: %w", err)
+	}
 	switch {
 	case len(template.Outputs) < len(expected):
 		return errors.New("sigall settle template omits a committed v4v split output")

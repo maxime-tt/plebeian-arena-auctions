@@ -148,7 +148,7 @@ func TestSigAllLocktimeFloorUsesEstablishedEnd(t *testing.T) {
 	au := a.st.Auctions[id]
 	au.Mode, au.WindowSec, au.EndAt = "antisnipe", 300, tNow+10
 	now := tNow // the bid arrives with 10 s left: it extends the end to now+300
-	got := a.st.minLocktime(au, now)
+	got := a.st.minLocktime(au, now, true)
 	want := (now + 300) + a.st.Params.SettlementSafetySec + a.st.Params.BidToConsensusLatencySec // = now+1215
 	if got != want {
 		t.Fatalf("minLocktime %d, want %d (the NEW end + 900 + 15)", got, want)
@@ -176,7 +176,7 @@ func TestSigAllLocktimeFloorIsBlockTimeNotBidderClock(t *testing.T) {
 	T := tNow + 50 // the block's time; the bidder's clock is 60 s behind it
 	au.EndAt = T + 10
 	want := T + window + a.st.Params.SettlementSafetySec + a.st.Params.BidToConsensusLatencySec
-	if got := a.st.minLocktime(au, T); got != want {
+	if got := a.st.minLocktime(au, T, true); got != want {
 		t.Fatalf("minLocktime at block time %d = %d, want %d (now + WindowSec + safety + latency)", T, got, want)
 	}
 
@@ -236,10 +236,10 @@ func TestSigAllFixedLotFloorIsStable(t *testing.T) {
 	a, _, id := liveApp(t)
 	au := a.st.Auctions[id]
 	base := au.EndAt + a.st.Params.SettlementSafetySec + a.st.Params.BidToConsensusLatencySec
-	if got := a.st.minLocktime(au, tNow); got != base {
+	if got := a.st.minLocktime(au, tNow, false); got != base {
 		t.Fatalf("fixed floor at tNow: %d, want %d", got, base)
 	}
-	if got := a.st.minLocktime(au, tNow+50); got != base {
+	if got := a.st.minLocktime(au, tNow+50, false); got != base {
 		t.Fatalf("fixed floor must not grow with the clock: %d, want %d", got, base)
 	}
 }
@@ -266,7 +266,7 @@ func TestSigAllTemplateWrongDestinationRefusedByName(t *testing.T) {
 	c.OutcomeTemplates.Settle.Digest, c.OutcomeTemplates.Settle.BidderSignature = d, hex.EncodeToString(sig.Serialize())
 
 	err := a.st.applyBid(&Event{ID: hx(88), Pubkey: bob.pub, Tags: [][]string{{"e", a.st.Auctions[id].RootID}}, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
-	if err == nil || !strings.Contains(err.Error(), "is not locked to the auction's committed seller payout key") {
+	if err == nil || !strings.Contains(err.Error(), "not locked to the committed destination") {
 		t.Fatalf("wrong destination not refused by name: %v", err)
 	}
 }

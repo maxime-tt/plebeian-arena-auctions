@@ -100,7 +100,7 @@ func TestVerdictPublishE2ERelayOnlyClientReconstructsOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.st.Params = Params{KeysetID: m.id, Keys: map[string]string{}, GroupKey: group, LockMarginSec: 30, MaxProofs: 64,
-		MinWindowSec: 15, MaxWindowSec: 900, MinDurationSec: 20, MaxDurationSec: 100000,
+		MinWindowSec: 15, MaxWindowSec: 900, MinDurationSec: 20, MaxDurationSec: 100000, MintURL: testMintAddr,
 		Validators: []ValidatorKey{{Pubkey: NostrPubkeyHex(vk), Name: "Validator 1", Index: 1}}}
 	for _, amt := range []int64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512} {
 		a.st.Params.Keys[fmt.Sprint(amt)] = hexCompressedGroupKey(m)
@@ -108,7 +108,7 @@ func TestVerdictPublishE2ERelayOnlyClientReconstructsOutcome(t *testing.T) {
 	a.st.Height, a.st.Time = 10, tNow
 
 	seller := newBidder(t)
-	c := CreateContent{Title: "e2e lot", StartPrice: 100, MinIncrement: 10, DurationSec: 100, SellerWallet: seller.wallet, Mode: "fixed"}
+	c := CreateContent{Title: "e2e lot", StartPrice: 100, MinIncrement: 10, DurationSec: 100, SellerWallet: seller.wallet, Mode: "fixed", MintURL: testMintAddr}
 	createEv := createEv(t, seller.sk, "lot-e2e", c, tNow)
 	createTx, _ := json.Marshal(createEv)
 	coord := coordOf(seller.pub, "lot-e2e")

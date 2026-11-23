@@ -61,7 +61,7 @@ func v4vCreateApp(t *testing.T, rows []SplitRow) (*App, *testMint, string, *Auct
 
 func TestV4VSplitAcceptedAtCreate(t *testing.T) {
 	s := newState()
-	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MinWindowSec: 60, MaxWindowSec: 900}
+	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MinWindowSec: 60, MaxWindowSec: 900, MintURL: testMintAddr}
 	seller := newBidder(t)
 	validatorX, v4vY := realPub(t, 21), realPub(t, 22)
 	// deliberately v4v before validator: the committed order is canonicalised.
@@ -86,7 +86,7 @@ func TestV4VSplitAcceptedAtCreate(t *testing.T) {
 
 func TestV4VSplitTotalExceeds10000Refused(t *testing.T) {
 	s := newState()
-	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200}
+	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MintURL: testMintAddr}
 	seller := newBidder(t)
 	c := baseCreate()
 	c.V4VSplit = []SplitRow{splitRow("v4v", realPub(t, 21), 6000), splitRow("v4v", realPub(t, 22), 5000)}
@@ -99,7 +99,7 @@ func TestV4VSplitTotalExceeds10000Refused(t *testing.T) {
 
 func TestV4VSplitDuplicateRecipientRefused(t *testing.T) {
 	s := newState()
-	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200}
+	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MintURL: testMintAddr}
 	seller := newBidder(t)
 	dup := realPub(t, 21)
 	c := baseCreate()
@@ -113,7 +113,7 @@ func TestV4VSplitDuplicateRecipientRefused(t *testing.T) {
 
 func TestV4VSplitUnknownRoleRefused(t *testing.T) {
 	s := newState()
-	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200}
+	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MintURL: testMintAddr}
 	seller := newBidder(t)
 	c := baseCreate()
 	c.V4VSplit = []SplitRow{splitRow("seller", realPub(t, 21), 500)}
@@ -137,7 +137,7 @@ func TestV4VSplitBpsNotIntegerOrNegativeRefused(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := newState()
-			s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200}
+			s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MintURL: testMintAddr}
 			seller := newBidder(t)
 			c := baseCreate()
 			c.V4VSplit = []SplitRow{{Role: "v4v", RecipientPubkey: realPub(t, 21), AllocationBps: tc.bps}}
@@ -153,7 +153,7 @@ func TestV4VSplitBpsNotIntegerOrNegativeRefused(t *testing.T) {
 // baseCreate is a valid create payload for the fixtures above.
 func baseCreate() CreateContent {
 	return CreateContent{Title: "lot", DurationSec: 100, StartPrice: 100, MinIncrement: 10,
-		SellerWallet: sellerWalletKey(), Mode: "fixed"}
+		SellerWallet: sellerWalletKey(), Mode: "fixed", MintURL: testMintAddr}
 }
 
 // sellerWalletKey is a fixed, valid compressed seller payout key.
@@ -170,7 +170,7 @@ func sellerWalletKey() string {
 // liveApp fixture: it needs the seller's own key to sign the edit.
 func TestV4VSplitEditRefusedByName(t *testing.T) {
 	s := newState()
-	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MinWindowSec: 60, MaxWindowSec: 900}
+	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MinWindowSec: 60, MaxWindowSec: 900, MintURL: testMintAddr}
 	seller := newBidder(t)
 	recipient := realPub(t, 21)
 
@@ -210,7 +210,7 @@ func TestV4VSplitEditRefusedByName(t *testing.T) {
 func mkOut(recipient string, amount int64, idx int, keyset, tag string) sigAllTemplateOutput {
 	return sigAllTemplateOutput{
 		Amount: amount, ID: keyset,
-		Secret: p2pkOut(recipient, fmt.Sprintf("%s-%064x", tag, 0x3000+idx+1)),
+		Secret: p2pkOut(recipient, templateNonce(tag, 0x3000+idx+1)),
 		R:      fmt.Sprintf("%064x", 0x400000+idx+1),
 	}
 }
@@ -243,7 +243,9 @@ func v4vBid(t *testing.T, a *App, m *testMint, b bidder, auction string, amount 
 	mutateSettle, mutateRefund func(*sigAllSignedTemplate)) (*Event, []byte) {
 	t.Helper()
 	au := a.st.Auctions[auction]
-	lt := a.st.minLocktime(au, a.st.Time)
+	takesLead := a.st.takesLead(au, b.pub)
+	extends := a.st.bidExtends(au, a.st.Time, takesLead)
+	lt := a.st.minLocktime(au, a.st.Time, extends)
 	var proofs []Proof
 	left, i := amount, 0
 	for d := int64(512); d >= 1; d /= 2 {
@@ -254,7 +256,25 @@ func v4vBid(t *testing.T, a *App, m *testMint, b bidder, auction string, amount 
 		}
 	}
 	var sout []sigAllTemplateOutput
-	for j, so := range splitSats(au.SellerWallet, au.V4VSplit, amount) {
+	split, err := splitSats(au.SellerWallet, au.V4VSplit, amount, a.st.Params.Keys)
+	if err != nil {
+		// An admission-refusal test needs a template even when the split cannot
+		// be represented. Build the raw, undecomposed shape (one output per
+		// committed row plus the seller remainder) so the consensus rule that
+		// refuses it -- a zero share or an undecomposable amount -- is what the
+		// test exercises, not this fixture.
+		split = nil
+		var allocated int64
+		for _, row := range au.V4VSplit {
+			share := amount * row.AllocationBps / v4vTotalBps
+			allocated += share
+			split = append(split, splitOut{Recipient: row.RecipientPubkey, Amount: share})
+		}
+		if rem := amount - allocated; rem > 0 {
+			split = append(split, splitOut{Recipient: au.SellerWallet, Amount: rem})
+		}
+	}
+	for j, so := range split {
 		sout = append(sout, mkOut(so.Recipient, so.Amount, j, m.id, nonce))
 	}
 	settle := sigAllSignedTemplate{Outputs: sout}
@@ -328,7 +348,8 @@ func TestV4VSettleTemplateReordersRowsRefused(t *testing.T) {
 	a, m, id, _ := v4vCreateApp(t, rows)
 	bob := newBidder(t)
 	ev, _ := v4vBid(t, a, m, bob, id, 200, "ad", func(tpl *sigAllSignedTemplate) {
-		tpl.Outputs[0], tpl.Outputs[1] = tpl.Outputs[1], tpl.Outputs[0]
+		// swap one denomination of row 0 with one of row 1
+		tpl.Outputs[0], tpl.Outputs[3] = tpl.Outputs[3], tpl.Outputs[0]
 	}, nil)
 	err := a.st.applyBid(ev, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "reordered") {
@@ -371,15 +392,25 @@ func TestV4VRoundingRemainderToSeller(t *testing.T) {
 	rows := []SplitRow{splitRow("v4v", realPub(t, 21), 3333), splitRow("v4v", realPub(t, 22), 3333)}
 	a, m, id, au := v4vCreateApp(t, rows)
 
-	outs := splitSats(au.SellerWallet, au.V4VSplit, 100)
-	if len(outs) != 3 {
-		t.Fatalf("want 3 outputs (2 rows + seller), got %d: %+v", len(outs), outs)
+	outs, err := splitSats(au.SellerWallet, au.V4VSplit, 100, a.st.Params.Keys)
+	if err != nil {
+		t.Fatalf("split cannot be decomposed: %v", err)
 	}
-	if outs[0].Amount != 33 || outs[1].Amount != 33 {
-		t.Fatalf("floored shares wrong: %+v", outs)
+	// The 33/33 shares decompose to 1+32 and the seller's 34 to 2+32, each
+	// recipient's parts ascending, rows in committed order.
+	if len(outs) != 6 {
+		t.Fatalf("want 6 denomination outputs (2 rows + seller, decomposed), got %d: %+v", len(outs), outs)
 	}
-	if !sameKey(outs[2].Recipient, au.SellerWallet) || outs[2].Amount != 34 {
-		t.Fatalf("the rounding remainder must go to the seller (want 34), got %+v", outs[2])
+	row1, row2 := realPub(t, 21), realPub(t, 22)
+	want := []splitOut{
+		{Recipient: row1, Amount: 1}, {Recipient: row1, Amount: 32},
+		{Recipient: row2, Amount: 1}, {Recipient: row2, Amount: 32},
+		{Recipient: au.SellerWallet, Amount: 2}, {Recipient: au.SellerWallet, Amount: 32},
+	}
+	for i, w := range want {
+		if !sameKey(outs[i].Recipient, w.Recipient) || outs[i].Amount != w.Amount {
+			t.Fatalf("output %d = %+v, want %+v (all outputs: %+v)", i, outs[i], w, outs)
+		}
 	}
 	var sum int64
 	for _, o := range outs {
@@ -396,13 +427,13 @@ func TestV4VRoundingRemainderToSeller(t *testing.T) {
 		t.Fatalf("the floored template must be admitted: %v", err)
 	}
 
-	// a template that takes the dust from the seller (33/34/33) is refused
+	// a template that reprices the seller's remainder is refused
 	a2, m2, id2, _ := v4vCreateApp(t, rows)
 	bob2 := newBidder(t)
 	ev2, _ := v4vBid(t, a2, m2, bob2, id2, 100, "b1", func(tpl *sigAllSignedTemplate) {
-		tpl.Outputs[1].Amount, tpl.Outputs[2].Amount = 34, 33
+		tpl.Outputs[4].Amount = 1 // the seller's 2-sat remainder part
 	}, nil)
-	err := a2.st.applyBid(ev2, tNow, 11, true, true)
+	err = a2.st.applyBid(ev2, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "reprices the committed split row") {
 		t.Fatalf("a template that moves the seller's dust must be refused, got %v", err)
 	}
@@ -413,9 +444,26 @@ func TestV4VRoundingRemainderToSeller(t *testing.T) {
 func TestV4VFullSplitLeavesNoSellerOutput(t *testing.T) {
 	rows := []SplitRow{splitRow("v4v", realPub(t, 21), 5000), splitRow("v4v", realPub(t, 22), 5000)}
 	a, m, id, au := v4vCreateApp(t, rows)
-	outs := splitSats(au.SellerWallet, au.V4VSplit, 200)
-	if len(outs) != 2 {
-		t.Fatalf("a full 10000 bps split that divides evenly must have no seller output, got %+v", outs)
+	outs, err := splitSats(au.SellerWallet, au.V4VSplit, 200, a.st.Params.Keys)
+	if err != nil {
+		t.Fatalf("split cannot be decomposed: %v", err)
+	}
+	// Each 100-sat share decomposes to 4+32+64: six outputs, all to the two
+	// committed rows, and none to the seller (the remainder is zero).
+	if len(outs) != 6 {
+		t.Fatalf("a full 10000 bps split that divides evenly must have six denomination outputs (2 rows x 3), got %+v", outs)
+	}
+	row1, row2 := realPub(t, 21), realPub(t, 22)
+	for i, o := range outs {
+		if !sameKey(o.Recipient, row1) && !sameKey(o.Recipient, row2) {
+			t.Fatalf("a full split must leave no seller output, got %+v", o)
+		}
+		if i < 3 && !sameKey(o.Recipient, row1) || i >= 3 && !sameKey(o.Recipient, row2) {
+			t.Fatalf("output %d must belong to committed row %d: %+v", i, i/3, outs)
+		}
+	}
+	if outs[0].Amount != 4 || outs[1].Amount != 32 || outs[2].Amount != 64 {
+		t.Fatalf("100 sats must decompose to 4+32+64 ascending, got %+v", outs[:3])
 	}
 	bob := newBidder(t)
 	ev, _ := v4vBid(t, a, m, bob, id, 200, "c0", nil, nil)

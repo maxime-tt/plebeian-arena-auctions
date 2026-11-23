@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -350,6 +351,19 @@ type CreateContent struct {
 	// the auction, and reproduced exactly by the bidder's pre-signed SETTLE
 	// template.
 	V4VSplit []SplitRow `json:"v4vSplit,omitempty"`
+	// MintURL is the mint this lot escrows against (spec §3.6, handover §6.4):
+	// a ROOT create MUST name it and it must equal the mint the chain commits in
+	// Params.MintURL, because a validator accepts a lot only if it trusts that
+	// mint.  A supersession may omit it (the root already announced it) but must
+	// not name a different one.  It is NOT stored on the Auction: the trusted
+	// mint is committed state (Params), not per-lot state.
+	MintURL string `json:"mintUrl,omitempty"`
+	// Relays is the OPTIONAL list of relays the seller announces for the lot
+	// (spec §3.6).  It is validated when present (ws:// or wss:// with a host,
+	// at most MaxCreateRelays, no duplicates) and is NOT stored on the Auction:
+	// cross-relay operation is a separate increment, so this is an announcement,
+	// never committed routing.
+	Relays []string `json:"relays,omitempty"`
 }
 
 type BidContent struct {
@@ -612,6 +626,14 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 	}
 
 	cur := s.Auctions[coord]
+	// Mint trust and relay announcements (spec §3.6/§3.7, handover §6.4).  These
+	// are create-content rules, checked AFTER the field rules above so a create
+	// that is refused for its title still says so: the refusal reason a client
+	// reads (kind 1450) must name the first thing that is wrong, and the CheckTx
+	// "will be decided at delivery" note carries that same first reason.
+	if err := s.checkCreateMintAndRelays(cur, &c); err != nil {
+		return err
+	}
 	if cur == nil {
 		// The root: the first 1440 for this (seller, d). It must not claim a
 		// root it cannot know about — only a supersession carries e.
@@ -663,18 +685,102 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 	return nil
 }
 
+// MaxCreateRelays bounds the relay list a create may announce (spec §3.6).  It
+// is deliberately small: the announcement is a hint for a client, and a create
+// that names an unbounded list is a denial-of-service shape, not a lot.
+const MaxCreateRelays = 8
+
+// normalizeMint normalises a mint URL for comparison: it drops a trailing slash
+// (the ONLY normalisation, so nothing else is silently rewritten) and trims
+// surrounding space.
+func normalizeMint(u string) string { return strings.TrimRight(strings.TrimSpace(u), "/") }
+
+// validRelayURL: a relay a create announces must be a ws:// or wss:// URL that
+// names a host.  A bare scheme, a relative path or an http(s) URL is not a
+// relay and is refused by name.
+func validRelayURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "ws" && u.Scheme != "wss" {
+		return false
+	}
+	return u.Host != ""
+}
+
+// checkCreateRelays validates the OPTIONAL relay list a create announces
+// (spec §3.6): only ws:// or wss:// URLs with a host, at most MaxCreateRelays,
+// no duplicates.  An empty list is fine -- the announcement is optional.
+func checkCreateRelays(relays []string) error {
+	if len(relays) > MaxCreateRelays {
+		return fmt.Errorf("create announces %d relays (max %d)", len(relays), MaxCreateRelays)
+	}
+	seen := make(map[string]bool, len(relays))
+	for _, r := range relays {
+		if !validRelayURL(r) {
+			return fmt.Errorf("create relay %q must be a ws:// or wss:// URL with a host", r)
+		}
+		if seen[r] {
+			return fmt.Errorf("create relay %q is announced twice", r)
+		}
+		seen[r] = true
+	}
+	return nil
+}
+
+// checkCreateMintAndRelays enforces the create's mint and relay announcements
+// (spec §3.6/§3.7, handover §6.4).  cur is the lot's canonical auction, nil for
+// a ROOT create:
+//
+//   - a ROOT create must name a mint, and it must be the mint the chain trusts
+//     (Params.MintURL) -- otherwise a validator would escrow a bidder's proofs
+//     against a mint it cannot rely on;
+//   - a supersession MAY omit the mint (the root already announced it) but must
+//     not name a different one;
+//   - relays are validated when present, on either shape.
+//
+// Every refusal is by name.  Nothing here is stored on the Auction: the trusted
+// mint lives in Params and the relays are an announcement, not committed
+// routing (the state encoding does not change).
+func (s *State) checkCreateMintAndRelays(cur *Auction, c *CreateContent) error {
+	if err := checkCreateRelays(c.Relays); err != nil {
+		return err
+	}
+	switch {
+	case cur == nil && strings.TrimSpace(c.MintURL) == "":
+		return errors.New("create must name a mint (mintUrl)")
+	case strings.TrimSpace(c.MintURL) != "" && normalizeMint(c.MintURL) != normalizeMint(s.Params.MintURL):
+		return fmt.Errorf("create names an untrusted mint %q", c.MintURL)
+	}
+	return nil
+}
+
+// takesLead reports whether an incoming bid by pubkey CHANGES THE LEAD. A
+// first bid takes the lead; a bidder who is not the current leader takes it
+// from them; a leader raising their own position does NOT take the lead again.
+// This is the one definition applyBid uses to decide whether the anti-snipe
+// clock may move, so a self-raise can never extend a lot.
+func (s *State) takesLead(au *Auction, pubkey string) bool {
+	return au.HighBid == "" || s.Bids[au.HighBid].Bidder != pubkey
+}
+
+// bidExtends reports whether this bid moves the anti-snipe end. Only a
+// lead-changing bid arriving inside the window extends: a self-raise must not,
+// or one bidder could hold a lot open indefinitely. A bid at or after EndAt is
+// already late (closeDue has run) and never extends.
+func (s *State) bidExtends(au *Auction, now int64, takesLead bool) bool {
+	return au.Mode == "antisnipe" && now < au.EndAt && au.EndAt-now < au.WindowSec && takesLead
+}
+
 // establishedEnd is the end time a bid establishes, given whether it extends.
-// For an antisnipe bid that arrives with less than WindowSec left, the lot's
-// end becomes now+WindowSec (see applyBid), so THAT is the end the bid's
-// locktime must clear. For a fixed lot, and for an antisnipe bid that does not
-// extend, it is the lot's current EndAt.
+// A lead-changing bid inside the window moves the lot's end to now+WindowSec
+// (see applyBid), so THAT is the end the bid's locktime must clear. Every
+// other bid -- a fixed lot, or a self-raise inside the window -- establishes
+// the lot's current EndAt. The `extends` argument is resolved by the caller
+// (applyBid) and is never recomputed from the clock here.
 func (s *State) establishedEnd(au *Auction, now int64, extends bool) int64 {
 	if extends {
-		return now + au.WindowSec
-	}
-	if au.Mode == "antisnipe" && au.EndAt < now+au.WindowSec {
-		// The bid arrives inside the window: it wins the extension, so treat
-		// the new end as established even before applyBid commits it.
 		return now + au.WindowSec
 	}
 	return au.EndAt
@@ -686,18 +792,19 @@ func (s *State) establishedEnd(au *Auction, now int64, extends bool) int64 {
 //	minLocktime = max(establishedEnd, now + WindowSec)
 //	            + SettlementSafetySec + BidToConsensusLatencySec
 //
-// It MUST be evaluated against the post-extension end: checking before the
-// extension would validate an extending bid against the OLD end and collapse
-// the post-end safety margin from SettlementSafetySec to as little as
-// BidToConsensusLatencySec (spec §2.2).
-func (s *State) minLocktime(au *Auction, now int64) int64 {
-	end := s.establishedEnd(au, now, au.Mode == "antisnipe" && au.EndAt-now < au.WindowSec)
+// The now+WindowSec term applies only when the bid EXTENDS (it is already the
+// established end then, so the max is explicit rather than incidental). A
+// self-raise inside the window establishes the OLD end, so its floor is
+// au.EndAt + SettlementSafetySec + BidToConsensusLatencySec: it must still
+// clear the settlement safety even though it does not move the clock. `extends`
+// is an input, never a clock recomputation, so admission and the signing policy
+// cannot disagree about which end a bid survives.
+func (s *State) minLocktime(au *Auction, now int64, extends bool) int64 {
+	end := s.establishedEnd(au, now, extends)
 	floor := end
-	// The now+WindowSec term guarantees an anti-snipe bid carries at least a
-	// full window of lock after the moment it extends the end. A fixed lot has
-	// no window (WindowSec is 0 and its end never moves), so the term is
-	// vacuous and the floor is the lot's own end.
-	if au.Mode == "antisnipe" && now+au.WindowSec > floor {
+	// A fixed lot has no window (WindowSec is 0 and its end never moves), so
+	// the term is vacuous and the floor is the lot's own end.
+	if extends && now+au.WindowSec > floor {
 		floor = now + au.WindowSec
 	}
 	return floor + s.Params.SettlementSafetySec + s.Params.BidToConsensusLatencySec
@@ -747,6 +854,16 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if a, ok := tagValue(ev.Tags, "a"); ok && a != au.ID {
 		return errors.New("bid's a coordinate does not match the auction")
 	}
+	// The anti-snipe decision is resolved BEFORE the locktime floor, because
+	// the floor must be the end THIS bid must survive. Only a bid that CHANGES
+	// THE LEAD may move the clock: a first bid or a challenger takes the lead,
+	// while the leader raising their own position does not. A self-raise
+	// therefore cannot extend the lot (and cannot hold it open indefinitely),
+	// and its escrow must still clear the CURRENT end plus the settlement
+	// safety. The order is load-bearing: resolve extends -> derive the floor
+	// from the end this bid establishes -> check the lock.
+	takesLead := s.takesLead(au, ev.Pubkey)
+	extends := s.bidExtends(au, now, takesLead)
 	// 1. Is it economically admissible? This is the CHEAP half of the
 	// transition -- pure arithmetic, no cryptography -- and it runs FIRST so a
 	// bid that is late ON ARRIVAL at CheckTx (apply == false) is refused
@@ -888,7 +1005,7 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if sum != b.Amount {
 		return fmt.Errorf("proofs total %d but bid is %d", sum, b.Amount)
 	}
-	lt, err := s.checkLock(b.Proofs, wallet, s.minLocktime(au, now))
+	lt, err := s.checkLock(b.Proofs, wallet, s.minLocktime(au, now, extends))
 	if err != nil {
 		return err
 	}
@@ -934,10 +1051,14 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 			}
 		}
 	}
-	// Anti-snipe (ADR 0009): a bid with less than the window left puts the
-	// clock back to the window. No cap: the lot ends when the bidding stops.
-	// Fixed lots end at their set time, whatever happens.
-	if au.Mode == "antisnipe" && au.EndAt-now < au.WindowSec {
+	// Anti-snipe (ADR 0009): a LEAD-CHANGING bid with less than the window left
+	// puts the clock back to the window. A self-raise does not: the leader
+	// already owns the position, so letting them extend would let one bidder
+	// hold the lot open forever. No cap: the lot ends when the bidding stops.
+	// Fixed lots end at their set time, whatever happens. `extends` was resolved
+	// above and is the same decision the locktime floor used, so a bid can never
+	// be validated against one end and commit another.
+	if extends {
 		au.EndAt = now + au.WindowSec
 		au.Extensions++
 		bid.Extended = true
@@ -976,6 +1097,12 @@ func (s *State) closeDue(now, height int64) {
 			// promoted to won. Void bids are not in au.Bids at all.
 			//
 			// INVARIANT: HighAmount == Σ { bid.Amount : bid.Status == "won" }.
+			// INVARIANT (asserted by TestClosedWonLegsClearSettlementSafety):
+			// every won leg has Locktime > ClosedAt + SettlementSafetySec.
+			// minLocktime derives each won leg's locktime from the end the bid
+			// establishes plus the safety and latency, so a close at EndAt keeps
+			// the settlement margin. This is the tripwire for a future change
+			// that moves the end without moving the floor.
 			for _, id := range au.Bids {
 				if s.Bids[id].Status == "leading" {
 					s.Bids[id].Status = "won"

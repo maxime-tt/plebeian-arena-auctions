@@ -21,10 +21,10 @@ func FuzzDecodeTx(f *testing.F) {
 
 func FuzzApplyContent(f *testing.F) {
 	f.Add(`{"auction":"a","amount":5,"wallet":"02","proofs":[{"id":"00","amount":1,"secret":"x","C":"02","dleq":{"e":"00","s":"00","r":"00"}}]}`)
-	f.Add(`{"title":"t","startPrice":1,"minIncrement":1,"durationSec":60,"sellerWallet":"02"}`)
+	f.Add(`{"title":"t","startPrice":1,"minIncrement":1,"durationSec":60,"sellerWallet":"02","mintUrl":"` + testMintAddr + `"}`)
 	f.Fuzz(func(t *testing.T, c string) {
 		s := newState()
-		s.Params = Params{GroupKey: "02" + repeat("11", 32), KeysetID: "00", Keys: map[string]string{"1": "02" + repeat("11", 32)}, MaxProofs: 64, MinDurationSec: 20, MaxDurationSec: 7200}
+		s.Params = Params{GroupKey: "02" + repeat("11", 32), KeysetID: "00", Keys: map[string]string{"1": "02" + repeat("11", 32)}, MaxProofs: 64, MinDurationSec: 20, MaxDurationSec: 7200, MintURL: testMintAddr}
 		_ = s.applyCreate(&Event{ID: "a", Pubkey: "p", Kind: KindCreate, Content: c}, 100, 1, true)
 		_ = s.applyBid(&Event{ID: "b", Pubkey: "q", Kind: KindBid, Content: c}, 101, 2, true, true)
 		var p Proof

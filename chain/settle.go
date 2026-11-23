@@ -103,10 +103,53 @@ func (s *State) outcomeDue(bid *Bid, outcome string, now int64, signing bool) (s
 	return "", errors.New("outcome must be settle or refund")
 }
 
+// settlementDestinations derives, from committed chain state only, the
+// destination of each output of a bid's outcome template: one recipient per
+// committed V4V split row in order (the seller remainder last) for a settle
+// with a split, otherwise the single committed key (the seller payout key for
+// settle, the bidder's wallet key for refund). It is the single source the
+// settle verifier and the signing policy both compare against.
+func (s *State) settlementDestinations(bid *Bid, outcome string) ([]string, error) {
+	au := s.Auctions[bid.Auction]
+	if au == nil {
+		return nil, errors.New("unknown auction")
+	}
+	switch outcome {
+	case "refund":
+		if bid.Wallet == "" {
+			return nil, errors.New("bid committed no wallet spend key")
+		}
+		return []string{bid.Wallet}, nil
+	case "settle":
+		if len(au.V4VSplit) > 0 {
+			rows, err := splitSats(au.SellerWallet, au.V4VSplit, bid.Amount, s.Params.Keys)
+			if err != nil {
+				return nil, fmt.Errorf("sigall settle template: %w", err)
+			}
+			out := make([]string, 0, len(rows))
+			for _, row := range rows {
+				out = append(out, row.Recipient)
+			}
+			return out, nil
+		}
+		if au.SellerWallet == "" {
+			return nil, errors.New("auction committed no seller payout key")
+		}
+		return []string{au.SellerWallet}, nil
+	}
+	return nil, errors.New("outcome must be settle or refund")
+}
+
 // settlementOutputs turns a bid's committed outcome template into the SignOutput
 // list the FROST message and the mint swap are built from: each output's B_ is
 // recomputed from the committed secret and opening, so the committee signs
 // exactly what the bidder pre-signed and never chooses an output of its own.
+//
+// Before it returns -- and therefore before any validator signs -- every output
+// is held to the SAME strict parser admission uses: the canonical single-key
+// P2PK shape, locked to the destination committed on chain for that index, at a
+// denomination the mint can sign. A validator never signs a template it would
+// not have admitted.
 func (s *State) settlementOutputs(bid *Bid, outcome string) (sigAllSignedTemplate, []SignOutput, error) {
 	template, err := sigAllTemplateNamed(bid.OutcomeTemplates, outcome)
 	if err != nil {
@@ -118,6 +161,28 @@ func (s *State) settlementOutputs(bid *Bid, outcome string) (sigAllSignedTemplat
 	}
 	if len(outs) == 0 {
 		return sigAllSignedTemplate{}, nil, errors.New("committed template has no outputs")
+	}
+	destinations, err := s.settlementDestinations(bid, outcome)
+	if err != nil {
+		return sigAllSignedTemplate{}, nil, err
+	}
+	if len(destinations) > 1 && len(destinations) != len(template.Outputs) {
+		return sigAllSignedTemplate{}, nil, errors.New("committed v4v split does not match the committed template's outputs")
+	}
+	for index, out := range template.Outputs {
+		if out.ID != s.Params.KeysetID {
+			return sigAllSignedTemplate{}, nil, fmt.Errorf("sigall %s output %d names keyset %q, not the pinned %q", outcome, index, out.ID, s.Params.KeysetID)
+		}
+		if err := sigAllAmountPinned(out.Amount, s.Params); err != nil {
+			return sigAllSignedTemplate{}, nil, fmt.Errorf("sigall %s output %d: %w", outcome, index, err)
+		}
+		dest := destinations[0]
+		if len(destinations) > 1 {
+			dest = destinations[index]
+		}
+		if err := strictTemplateOutput(out.Secret, dest); err != nil {
+			return sigAllSignedTemplate{}, nil, fmt.Errorf("sigall %s output %d: %w", outcome, index, err)
+		}
 	}
 	return template, outs, nil
 }
@@ -161,21 +226,18 @@ func (s *State) verifySettle(st *settleTx, now int64) (*settleCheck, error) {
 	if !isCompressedPub(to) {
 		return nil, errors.New("outcome has no committed destination")
 	}
-	au := s.Auctions[bid.Auction]
-	// expected[i] is the committed destination of output i. With no split it is
-	// the single destination repeated; with a split it is the committed row's
-	// recipient (and the seller's remainder last).
-	var expected []string
-	if st.Outcome == "settle" && au != nil && len(au.V4VSplit) > 0 {
-		for _, o := range splitSats(au.SellerWallet, au.V4VSplit, bid.Amount) {
-			expected = append(expected, o.Recipient)
-		}
+	// expected[i] is the committed destination of output i, derived by the same
+	// helper the signing policy uses: the single outcome destination, or one
+	// recipient per committed split row.
+	expected, err := s.settlementDestinations(bid, st.Outcome)
+	if err != nil {
+		return nil, err
 	}
 	template, outs, err := s.settlementOutputs(bid, st.Outcome)
 	if err != nil {
 		return nil, err
 	}
-	if len(expected) > 0 && len(expected) != len(outs) {
+	if len(expected) > 1 && len(expected) != len(outs) {
 		return nil, errors.New("committed split does not match the committed template's outputs")
 	}
 	if len(st.Proofs) == 0 || len(st.Proofs) > maxOutProofs(s.Params) || len(st.Proofs) != len(outs) {
@@ -210,8 +272,8 @@ func (s *State) verifySettle(st *settleTx, now int64) (*settleCheck, error) {
 		// And it must be locked to the committed destination of THIS output: the
 		// committed split row's recipient, or the single committed destination
 		// (spec §4/§6).
-		dest := to
-		if len(expected) > 0 {
+		dest := expected[0]
+		if len(expected) > 1 {
 			dest = expected[i]
 		}
 		if !s.recipientMatches(pr.Secret, dest) {
@@ -240,25 +302,13 @@ func (s *State) verifySettle(st *settleTx, now int64) (*settleCheck, error) {
 	return &settleCheck{ys: ys}, nil
 }
 
-// recipientMatches reports whether a template output secret is locked to key
-// (x-only compared), so a settle tx can never record ecash that pays anyone
-// but the committed destination. It also requires a PLAIN P2PK lock: a settled
-// output must not carry a locktime or a refund path (that would be the
-// forbidden re-lock shape, spec §4, and would strand the recipient).
+// recipientMatches reports whether a template output secret is the canonical
+// single-key P2PK condition locked to key (x-only compared), through the SAME
+// strictTemplateOutput parser admission and the signing policy use -- so a
+// settle tx can never record ecash that pays anyone but the committed
+// destination, in a shape those two would have accepted.
 func (s *State) recipientMatches(secret, key string) bool {
-	l, err := parseP2PK(secret)
-	if err != nil {
-		return false
-	}
-	if l.Locktime != 0 || len(l.Refund) != 0 || l.NSigs != 1 || len(l.Pubkeys) != 0 {
-		return false
-	}
-	if l.SigFlag != "" && l.SigFlag != "SIG_INPUTS" {
-		return false
-	}
-	rx, err1 := xOnlyOf(l.Data)
-	kx, err2 := xOnlyOf(key)
-	return err1 == nil && err2 == nil && rx == kx
+	return strictTemplateOutput(secret, key) == nil
 }
 
 func (s *State) applySettle(st *settleTx, v *settleCheck) {

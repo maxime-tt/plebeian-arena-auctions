@@ -21,6 +21,20 @@ async function until(f, ms = 30000, label = 'condition') {
   throw new Error('timeout waiting for ' + label);
 }
 const expectReject = async (p, re, msg) => { try { await p; ok(false, msg + ' (was accepted)'); } catch (e) { ok(re.test(e.message), `${msg} -> "${e.message}"`); } };
+// A create is ADMITTED at CheckTx by design (so its refusal can be anchored)
+// and refused deterministically at delivery. The seller learns why from the
+// chain's own rejection record here, and the validators publish the same
+// reason as an anchored kind-1450. Assert both: the refusal exists by name and
+// the lot never enters state.
+const expectCreateRefused = async (lot, re, msg) => {
+  const cr = await c.createAuction(seller, lot);
+  const r = await until(async () => {
+    const st = await c.state();
+    return (st.rejections || []).find((x) => x.event === cr.id && re.test(x.reason)) || null;
+  }, 15000, msg + ' anchored refusal');
+  const st = await c.state();
+  ok(!!r && !st.auctions[cr.coord], `${msg} -> "${r.reason}" (anchored refusal, no lot)`);
+};
 
 const seller = newIdentity('Seller'), alice = newIdentity('Alice'), bob = newIdentity('Bob'), carol = newIdentity('Carol');
 const bal = (u) => c.balance(u);
@@ -101,14 +115,14 @@ const cr = await c.createAuction(seller, { title: 'Test lot: 1-of-1 print', desc
 let s = await until(async () => { const st = await c.state(); return st.auctions[cr.coord] && st; }, 15000, 'create');
 const A = cr.coord; // the auction's state key is its coordinate 1440:<seller>:<d>, not the event id
 ok(s.auctions[A].status === 'open' && s.auctions[A].mode === 'fixed' && !('hardEnd' in s.auctions[A]), 'fixed-time lot open, no hard end');
-await expectReject(c.createAuction(seller, { title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'antisnipe', windowSec: 5 }), /window/, 'anti-snipe window below the minimum refused');
-await expectReject(c.createAuction(seller, { title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'dutch' }), /mode/, 'unknown auction mode refused');
+await expectCreateRefused({ title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'antisnipe', windowSec: 5 }, /window/, 'anti-snipe window below the minimum refused');
+await expectCreateRefused({ title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'dutch' }, /mode/, 'unknown auction mode refused');
 
 step(2, 'Fund wallets from the fake-sats faucet and place the first bid');
 for (const u of [alice, bob, carol]) await c.faucet(u, 1000);
 ok(await bal(alice) === 1000 && await bal(bob) === 1000 && await bal(carol) === 1000, 'each bidder holds 1000 fake sats in a Coco wallet');
-await expectReject(c.createAuction(seller, { title: '', startPrice: 0, minIncrement: 1, durationSec: 30 }), /title|range/, 'invalid lot rejected');
-await expectReject(c.createAuction(seller, { title: 'x', description: '', image: 'x" onerror="alert(1)', category: '', startPrice: 100, minIncrement: 10, durationSec: 30 }), /image/, 'lot with an unsafe image path rejected (audit A5)');
+await expectCreateRefused({ title: '', startPrice: 0, minIncrement: 1, durationSec: 30 }, /title|range/, 'invalid lot rejected');
+await expectCreateRefused({ title: 'x', description: '', image: 'x" onerror="alert(1)', category: '', startPrice: 100, minIncrement: 10, durationSec: 30 }, /image/, 'lot with an unsafe image path rejected (audit A5)');
 const b1 = await placeBid(alice, A, 100);
 ok(b1.state.auctions[A].highBid === b1.id, 'Alice leads at 100');
 const lock0 = JSON.parse(b1.state.bids[b1.id].proofs[0].secret)[1];
@@ -130,11 +144,12 @@ ok(p1.proofs.every((p) => JSON.parse(p.secret)[1].data === s.bids[b1.id].wallet)
 await until(async () => (await c.bidWithProofs(b1.id)).settled === 'refund', 10000, 'settle tx on chain');
 ok(true, 'settle tx recorded on chain');
 await expectReject(c.claim(alice, s.bids[b1.id], 'refund', s.params), /settled|spent/i, 'a pull release of the pushed escrow is refused');
-await expectReject(placeBid(carol, A, 115), /at least 120/, 'under-increment bid stopped by the client before locking');
-// The R3 refusal leaves the locked escrow untouched, so Carol's 115 stays
-// locked until its own locktime: her spendable balance is 115 short for the rest
-// of the walk, and the conservation step counts it as pendingReclaim.
-const REFUSED_LOCK = 115;
+await expectReject(placeBid(carol, A, 112), /at least 113/, 'under-increment bid stopped by the client before locking');
+// The R3 refusal leaves the locked escrow untouched, so Carol's 112 stays
+// locked until its own locktime: her spendable balance is 112 short for the rest
+// of the walk, and the conservation step counts it as pendingReclaim. The floor
+// is the chain's committed rule: top 110 + ceil(110 * 200 / 10000) = 110 + 3.
+const REFUSED_LOCK = 112;
 {
   // R3: an economically late bid is REFUSED AT ADMISSION. The chain never
   // commits it and never records a void, so the locked escrow is simply left
@@ -146,10 +161,10 @@ const REFUSED_LOCK = 115;
   const st = await c.state();
   const { locked } = await c.lockForBid(carol, REFUSED_LOCK, st.params, st.auctions[A], { force: true, state: st });
   stranded.push({ u: carol, locked });
-  await expectReject(c.bid(carol, st.auctions[A], REFUSED_LOCK, locked), /at least 120/, 'the chain REFUSES the under-increment bid at admission');
+  await expectReject(c.bid(carol, st.auctions[A], REFUSED_LOCK, locked), /at least 113/, 'the chain REFUSES the under-increment bid at admission');
   const sv = await c.state();
-  const carol115 = sv.auctions[A].bids.map((b) => sv.bids[b]).filter((b) => b.bidder === idPub(carol) && b.amount === REFUSED_LOCK);
-  ok(carol115.length === 0, 'no bid of Carol\'s 115 is on the chain (never committed)');
+  const carolRefused = sv.auctions[A].bids.map((b) => sv.bids[b]).filter((b) => b.bidder === idPub(carol) && b.amount === REFUSED_LOCK);
+  ok(carolRefused.length === 0, 'no bid of Carol\'s 112 is on the chain (never committed)');
   ok((sv.auctions[A].voids || []).length === 0, 'and the lot records no void for it');
   ok(sv.auctions[A].highBid === b2.id && sv.bids[b2.id].status === 'leading', 'Bob still leads');
   ok(await bal(carol) === 1000 - REFUSED_LOCK, `the refused escrow is untouched: Carol still holds ${1000 - REFUSED_LOCK} (${REFUSED_LOCK} locked until locktime)`);
@@ -157,7 +172,7 @@ const REFUSED_LOCK = 115;
   ok(!Object.values(v.state.bids).some((b) => b.auction === A && b.bidder === idPub(carol) && b.amount === REFUSED_LOCK),
     'the refusal left no bid of Carol\'s on this lot in her own view');
 }
-await expectReject((async () => { const st = await c.state(); return c.bid(seller, st.auctions[A], 500, []); })(), /proof count/, 'a bid without an escrow is refused outright');
+await expectReject((async () => { const st = await c.state(); return c.bid(carol, st.auctions[A], 500, []); })(), /proof count/, 'a bid without an escrow is refused outright');
 
 step(4, 'Fixed time: a last-seconds bid does not move the end');
 await until(async () => { const st = await c.state(); return st.auctions[A].endAt - Date.now() / 1000 < 12; }, 30000, 'last seconds');

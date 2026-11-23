@@ -476,10 +476,8 @@ func ParseVerdict(ev *Event, roster map[string]ValidatorKey) (*VerdictContent, e
 	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.BlockHash {
 		return nil, ErrVerdictUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrVerdictNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrVerdictNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }
@@ -527,10 +525,8 @@ func ParseStateCommitment(ev *Event, roster map[string]ValidatorKey) (*StateComm
 	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.AppHash {
 		return nil, ErrCommitmentUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrVerdictNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrVerdictNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }
@@ -581,10 +577,8 @@ func ParseStatePulse(ev *Event, roster map[string]ValidatorKey) (*StatePulseCont
 	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.AppHash {
 		return nil, ErrPulseUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrPulseNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrPulseNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }
@@ -653,10 +647,8 @@ func ParseParamsEvent(ev *Event, roster map[string]ValidatorKey) (*ParamsContent
 	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.AppHash {
 		return nil, ErrParamsUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrParamsNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrParamsNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }
@@ -790,10 +782,8 @@ func parseReceiptEvent(ev *Event, kind int, schema, outcome string, roster map[s
 	if len(c.Out) == 0 {
 		return nil, ErrReceiptNoOutputs
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrReceiptNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrReceiptNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }

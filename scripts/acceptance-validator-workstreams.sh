@@ -76,9 +76,9 @@ echo "== fresh chain root $ROOT (never run/chain) =="
 rm -rf "$ROOT"
 "$REPO/bin/arena" init -root "$ROOT" -mint "$MINT"
 
-echo "== gateway on 127.0.0.1:$PORT with demo controls (suite only, never a real-sats deployment) =="
+echo "== gateway on 127.0.0.1:$PORT in DEV mode with demo controls (suite only, never a real-sats deployment) =="
 (cd "$REPO" && set -m; nohup ./bin/arena gateway -root "$ROOT" -static "$ASSETS/web/dist" \
-  -addr "127.0.0.1:$PORT" -mint "$MINT" -relay "$RELAY" -demo-controls \
+  -addr "127.0.0.1:$PORT" -dev -mint "$MINT" -relay "$RELAY" -demo-controls \
   > "$LOGDIR/gateway.log" 2>&1 &)
 for _ in $(seq 1 40); do
   if curl -sf "127.0.0.1:$PORT/api/network" | grep -q '"up":true'; then break; fi

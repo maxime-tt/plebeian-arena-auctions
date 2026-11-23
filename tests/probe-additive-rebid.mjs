@@ -189,8 +189,11 @@ for (const [label, leg] of [['leg 1', leg1], ['leg 2', leg2]]) {
 
 // ── 3. R3: a below-floor bid is refused at admission ───────────────────────
 console.log('\n[3] R3: a below-floor bid is REFUSED at admission (never committed, never void)');
-const floor = au1.highAmount + au1.minIncrement; // 105 + 10
+// The chain's committed raise rule is 2% of the top (MinIncrementBps 200 by
+// default), not the create-side minIncrement field: ceil(105 * 200 / 10000) = 3.
 const stBefore = await c.state();
+const bps = Number(stBefore.params.minIncrementBps ?? 200);
+const floor = au1.highAmount + Math.max(1, Math.ceil(au1.highAmount * bps / 10000));
 const small = Math.max(1, floor - 1);
 const { locked: bobLocked } = await c.lockForBid(bob, small, stBefore.params, stBefore.auctions[coord], { force: true, state: stBefore });
 await attempt(c.bid(bob, stBefore.auctions[coord], small, bobLocked)

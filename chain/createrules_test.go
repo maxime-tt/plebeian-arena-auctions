@@ -29,7 +29,7 @@ import (
 // so a case can vary exactly one keep-out dimension.
 func createRuleState() *State {
 	s := newState()
-	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MinWindowSec: 60, MaxWindowSec: 900}
+	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 259200, MinWindowSec: 60, MaxWindowSec: 900, MintURL: testMintAddr}
 	return s
 }
 
@@ -45,7 +45,7 @@ func boundaryCreate() CreateContent {
 	return CreateContent{
 		Title: "lot", Description: "d", Image: "/a.png", Category: "art",
 		Name: "seller", StartPrice: 100, MinIncrement: 10, DurationSec: 100,
-		Mode: "fixed", SellerWallet: sellerWalletKey(),
+		Mode: "fixed", SellerWallet: sellerWalletKey(), MintURL: testMintAddr,
 	}
 }
 
@@ -345,7 +345,7 @@ const paramsVersionDigest = "59c82a68c2bf8437f4259422adeb107f373e62ac5e5da41c582
 // spelled out, so the pinned digest means something stable.
 func paramsForRulesTest() Params {
 	return Params{
-		MintURL:      "http://127.0.0.1:3338",
+		MintURL:      testMintAddr,
 		KeysetID:     "0102b930f4dc2d6a",
 		Keys:         map[string]string{"1": "02aa", "2": "02bb", "64": "02cc"},
 		GroupKey:     "03be47f12cc26f63cedb617ecc5dae10485aab91a63bd7ba808ae7c4f23e853da4",

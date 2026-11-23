@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -129,6 +130,14 @@ func cmdInit(args []string) {
 		}
 	}
 
+	// A mint is trusted only if it advertises NUT-10 (P2PK) and NUT-11
+	// (SIG_ALL) (handover §3.7).  Check it BEFORE anything is pinned or wiped:
+	// a refused mint must leave the root exactly as it was, and the check is
+	// what makes the mint this chain commits a CAPABLE one.
+	if err := requireMintCapabilities(context.Background(), *mint); err != nil {
+		log.Fatalf("arena init: %v", err)
+	}
+
 	// pin the mint's active sat keyset
 	var ks struct {
 		Keysets []struct {
@@ -241,11 +250,20 @@ func cmdNode(args []string) {
 	var relays relayURLs
 	fs.Var(&relays, "relay", "relay websocket URL: ingests auction events from it and publishes verdicts and state commitments to it (repeatable)")
 	commitMax := fs.Duration("commit-max-interval", StateCommitMaxInterval, "maximum wall-clock gap between state commitments")
+	meshHost := fs.String("mesh-host", "127.0.0.1", "address the mesh HTTP listener (the internal /state, /bid, /height, /due, /status and /frost endpoints) binds to; on a deployed node this is the node's FIPS address, on a single host it stays loopback")
 	fs.Parse(args)
 	if *every < 0 || *retain < 0 {
 		log.Fatal("-snapshot-every and -retain-blocks must be >= 0")
 	}
 	i := *idx - 1
+	// The mesh listener is NOT a public surface (handover §6.1/§6.2): it must
+	// name one interface.  The FIPS ACL is the peer firewall (handover §3.2),
+	// so there is no second auth scheme here -- binding 0.0.0.0/:: would expose
+	// the internal routes to everyone and is refused outright.
+	meshAddr := net.JoinHostPort(*meshHost, strconv.Itoa(httpPort(i)))
+	if err := validateBindAddr(meshAddr); err != nil {
+		log.Fatalf("node: %v", err)
+	}
 	home := homeOf(*root, i)
 	peers, err := os.ReadFile(filepath.Join(home, "peers.txt"))
 	check(err)
@@ -259,6 +277,15 @@ func cmdNode(args []string) {
 	check(json.Unmarshal(kb, &fk))
 	if fk.Participant != i+1 {
 		log.Fatal("frost_key.json belongs to another validator")
+	}
+	// A node must not run against a mint the chain does not trust (handover
+	// §6.4): the committed Params.MintURL must advertise NUT-10 (P2PK) and
+	// NUT-11 (SIG_ALL).  Fatal, and deliberately not a warning: an untrusted or
+	// downgraded mint silently weakens every escrow this node signs for.
+	gp, err := genesisParams(filepath.Join(home, "config", "genesis.json"))
+	check(err)
+	if err := requireMintCapabilities(context.Background(), gp.MintURL); err != nil {
+		log.Fatalf("%s: %v", names[i], err)
 	}
 	sessions := &frostSessions{m: map[string]frostSession{}}
 
@@ -283,7 +310,7 @@ func cmdNode(args []string) {
 		node.DefaultGenesisDocProviderFunc(c), cfg.DefaultDBProvider, node.DefaultMetricsProvider(c.Instrumentation), logger)
 	check(err)
 	check(n.Start())
-	log.Printf("%s up: p2p %d rpc %d http %d", names[i], p2pPort(i), rpcPort(i), httpPort(i))
+	log.Printf("%s up: p2p %d rpc %d http %s", names[i], p2pPort(i), rpcPort(i), meshAddr)
 	stopCloser := make(chan struct{})
 	go runCloser(app, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i)), stopCloser)
 
@@ -377,7 +404,11 @@ func cmdNode(args []string) {
 	})
 	mux.HandleFunc("/frost/commit", func(w http.ResponseWriter, r *http.Request) { handleCommit(w, r, app, fk, sessions, i) })
 	mux.HandleFunc("/frost/sign", func(w http.ResponseWriter, r *http.Request) { handleShare(w, r, fk, sessions, i) })
-	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", httpPort(i)), Handler: mux,
+	// The mesh listener: bound to ONE interface (the FIPS address on a deployed
+	// node, loopback on a single host).  The FIPS ACL is the peer firewall
+	// (handover §3.2) -- only whitelisted validator addresses reach this port --
+	// so there is deliberately no second auth scheme on these routes.
+	srv := &http.Server{Addr: meshAddr, Handler: mux,
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() { log.Println(srv.ListenAndServe()) }()
 

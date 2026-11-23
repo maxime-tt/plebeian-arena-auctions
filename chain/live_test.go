@@ -95,6 +95,14 @@ func p2pkOut(recipient, nonce string) string {
 	return fmt.Sprintf(`["P2PK",{"nonce":"%s","data":"%s","tags":[["sigflag","SIG_INPUTS"]]}]`, nonce, recipient)
 }
 
+// templateNonce derives a 64-character lowercase-hex nonce (the strict outcome
+// template's canonical form) from a caller tag and output index, keeping each
+// output distinct without ever emitting a non-hex character.
+func templateNonce(tag string, i int) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", tag, i)))
+	return hex.EncodeToString(h[:])
+}
+
 // templates builds the bidder's two pre-signed outcome templates for proofs:
 // settle -> sellerKey, refund -> the bidder's own wallet key. One output per
 // input, same amounts, same keyset (spec §1.2). The bidder signs each
@@ -107,7 +115,7 @@ func (m *testMint) templates(t *testing.T, b bidder, sellerKey string, proofs []
 		for i, p := range proofs {
 			inputs = append(inputs, sigAllTemplateInput{Amount: p.Amount, ID: p.ID, Secret: p.Secret, C: p.C})
 			outputs = append(outputs, sigAllTemplateOutput{Amount: p.Amount, ID: p.ID,
-				Secret: p2pkOut(recipient, fmt.Sprintf("%s-%064x", tag, 0x2000+i+1)),
+				Secret: p2pkOut(recipient, templateNonce(tag, 0x2000+i+1)),
 				R:      fmt.Sprintf("%064x", 0x100000+i+1)})
 		}
 		tpl := sigAllSignedTemplate{Inputs: inputs, Outputs: outputs}
@@ -162,6 +170,12 @@ func signEventTags(t *testing.T, sk *btcec.PrivateKey, kind int, content string,
 
 const tNow = int64(1_800_000_000)
 
+// testMintAddr is the mint URL the test fixtures commit in Params and name in
+// every root create: applyCreate accepts a root create only if it names exactly
+// the mint the chain trusts (Params.MintURL), so both sides must agree.  It is
+// the same address node.go defaults to.
+const testMintAddr = "http://127.0.0.1:3338"
+
 // liveApp: one open fixed-time lot (start 100, +10) ending at tNow+100.
 //
 // The lot is created through a real 1440 create event, so it is stored under
@@ -180,13 +194,13 @@ func liveAppSeller(t *testing.T) (*App, *testMint, string, bidder) {
 	a := NewApp()
 	a.st.Params = Params{KeysetID: m.id, Keys: map[string]string{}, GroupKey: group, MaxProofs: 64,
 		MinWindowSec: 60, MaxWindowSec: 900, SettlementSafetySec: 900, BidToConsensusLatencySec: 15,
-		MinDurationSec: 20, MaxDurationSec: 100000}
+		MinDurationSec: 20, MaxDurationSec: 100000, MintURL: testMintAddr}
 	for _, amt := range []int64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512} {
 		a.st.Params.Keys[fmt.Sprint(amt)] = hex.EncodeToString(m.A.SerializeCompressed())
 	}
 	a.st.Height, a.st.Time = 10, tNow
 	seller := newBidder(t)
-	c := CreateContent{Title: "lot", StartPrice: 100, MinIncrement: 10, DurationSec: 100, SellerWallet: seller.wallet, Mode: "fixed"}
+	c := CreateContent{Title: "lot", StartPrice: 100, MinIncrement: 10, DurationSec: 100, SellerWallet: seller.wallet, Mode: "fixed", MintURL: testMintAddr}
 	b, _ := json.Marshal(c)
 	root := signEventTags(t, seller.sk, KindCreate, string(b), tNow, [][]string{{"d", "lot-42"}})
 	if err := a.st.applyCreate(root, tNow, 10, true); err != nil {
@@ -214,7 +228,9 @@ func (m *testMint) bidTx(t *testing.T, a *App, b bidder, auction string, amount 
 	if au == nil {
 		au = a.st.Auctions[auction] // some tests name the auction by its coordinate
 	}
-	lt := a.st.minLocktime(au, a.st.Time)
+	takesLead := a.st.takesLead(au, b.pub)
+	extends := a.st.bidExtends(au, a.st.Time, takesLead)
+	lt := a.st.minLocktime(au, a.st.Time, extends)
 	left, i := amount, 0
 	for d := int64(512); d >= 1; d /= 2 {
 		for left >= d {

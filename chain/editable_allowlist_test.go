@@ -150,13 +150,14 @@ func TestNoScatteredKindLiterals(t *testing.T) {
 
 func baseLot() CreateContent {
 	return CreateContent{Title: "Vintage camera", Description: "tested", Image: "https://img.example/m3.jpg",
-		Category: "Art", StartPrice: 100, MinIncrement: 10, DurationSec: 60, SellerWallet: tW, Name: "Seller"}
+		Category: "Art", StartPrice: 100, MinIncrement: 10, DurationSec: 60, SellerWallet: tW, Name: "Seller",
+		MintURL: testMintAddr}
 }
 
 func auctionState() *State {
 	s := newState()
 	s.Height, s.Time = 1, tNow
-	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 7200, MinWindowSec: 15, MaxWindowSec: 900}
+	s.Params = Params{MinDurationSec: 20, MaxDurationSec: 7200, MinWindowSec: 15, MaxWindowSec: 900, MintURL: testMintAddr}
 	return s
 }
 
@@ -353,7 +354,7 @@ func auctionApp(t *testing.T, d string) (*App, *testMint, bidder, string, string
 	group := hex.EncodeToString(mulG(new(btcec.ModNScalar).SetInt(7)).SerializeCompressed())
 	a := NewApp()
 	a.st.Params = Params{KeysetID: m.id, Keys: map[string]string{}, GroupKey: group, LockMarginSec: 30, MaxProofs: 64,
-		MinWindowSec: 15, MaxWindowSec: 900, MinDurationSec: 20, MaxDurationSec: 7200}
+		MinWindowSec: 15, MaxWindowSec: 900, MinDurationSec: 20, MaxDurationSec: 7200, MintURL: testMintAddr}
 	for _, amt := range []int64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512} {
 		a.st.Params.Keys[fmt.Sprint(amt)] = hex.EncodeToString(m.A.SerializeCompressed())
 	}

@@ -224,10 +224,8 @@ func ParseLotEvent(ev *Event, roster map[string]ValidatorKey) (*LotContent, erro
 	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.BlockHash {
 		return nil, ErrLotUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrLotNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrLotNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }
@@ -340,10 +338,8 @@ func ParseBidAdmitEvent(ev *Event, roster map[string]ValidatorKey) (*BidAdmitCon
 	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.BlockHash {
 		return nil, ErrBidAdmitUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrBidAdmitNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrBidAdmitNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }
@@ -461,10 +457,8 @@ func ParseCreateAdmitEvent(ev *Event, roster map[string]ValidatorKey) (*CreateAd
 	if tagHeight != strconv.FormatInt(c.AcceptedHeight, 10) || tagHash != c.BlockHash {
 		return nil, ErrCreateAdmitUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrCreateAdmitNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrCreateAdmitNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }
@@ -524,10 +518,8 @@ func ParseRefusedEvent(ev *Event, roster map[string]ValidatorKey) (*RefusedConte
 	if tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.BlockHash {
 		return nil, ErrRefusedUnanchored
 	}
-	if roster != nil {
-		if _, ok := roster[ev.Pubkey]; !ok {
-			return nil, fmt.Errorf("%w: %s", ErrRefusedNotInRoster, ev.Pubkey)
-		}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrRefusedNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }

@@ -2,6 +2,14 @@
 
 Status: accepted (approved by the owner 2026-11-12; shipped in v0.5.0, chain format 5)
 
+> **Superseded in part (2026-11-23, v0.5.3):** the **re-lock** move (and the
+> `Relocks` counter) and the **`/api/release` pull release** are superseded by the
+> 2-of-2 `[bidder, committee]` `SIG_ALL` increment: `docs/PROTOCOL.md` §1, §4, §5
+> and §11. There is no re-lock and no pull release; the bidder pre-signs both
+> outcome templates at bid time and the settler executes them. The two auction
+> modes and push settlement stand. The sections below are kept as history; do not
+> follow them where they conflict with `docs/PROTOCOL.md`.
+
 ## Context
 
 The owner wants two kinds of auction, chosen by the seller when they list:
@@ -36,7 +44,7 @@ A **settler** loop runs in the gateway after every committed block. Each move be
 |---|---|---|
 | A bid becomes `outbid`, `void` or `lost` | Refund | P2PK to the bidder's wallet key |
 | A lot closes with a winner | Payout | P2PK to the seller's wallet key |
-| The leading bid's locktime is less than `LockMarginSec / 2` away | Re-lock | P2PK to the FROST group key, refund key = bidder, new locktime = now + `LockMarginSec` |
+| The leading bid's locktime is less than `LockMarginSec / 2` away | **Superseded** — re-lock (no longer exists; `docs/PROTOCOL.md` §11) | P2PK to the FROST group key, refund key = bidder, new locktime = now + `LockMarginSec` |
 
 - **The validators can check what they sign.** Outputs are blinded, so for each output the settler reveals the secret and the blinding factor. Each validator recomputes `B_` and checks three things: the lock is the one in the table for this bid, the amounts add up, and the bid's chain status allows the move. Only then does it commit a nonce. Revealing these is harmless, because each output can only be spent with the recipient's key (or the group key, for a re-lock).
 - **Settlements are recorded on chain.** After the swap, the settler sends a `settle` transaction with the bid ID, the move, the new proofs and the mint's DLEQ proofs. Validators check that it matches the move they signed, then:
@@ -49,13 +57,22 @@ A **settler** loop runs in the gateway after every committed block. Each move be
 
 ### Lock expiry for bids
 
+> **Superseded (v0.5.3):** the lock floor is now a single rule —
+> `max(EndAt, now + WindowSec) + SettlementSafetySec + BidToConsensusLatencySec`
+> (900 + 15 = 915 s) — and **there is no re-lock** (`docs/PROTOCOL.md` §2).
+
 - **Fixed lots:** `locktime ≥ endAt + LockMarginSec`, as today.
 - **Anti-snipe lots:** `locktime ≥ blockTime + LockMarginSec`. The re-lock rule keeps the leading bid covered for as long as the lot runs.
 - **If a re-lock cannot happen** (fewer than 3 validators reachable until the leading lock expires), the lot closes with no sale. The bid becomes `lost` and is refunded by push, or by the bidder's own reclaim. A winner is never left in a lock the bidder can empty.
 
 ### Kept as fallbacks
 
-- The existing pull release (`/api/release` with the wallet's `auth`) stays, so a page can still settle if the settler is behind.
+> **The pull release is Superseded (v0.5.3):** `/api/release` is deleted; under
+> the 2-of-2 model the bidder's half is already pre-signed and the committee's
+> half is collected automatically off committed blocks, so there is nothing to
+> request (`docs/PROTOCOL.md` §5). The locktime reclaim stays.
+
+- ~~The existing pull release (`/api/release` with the wallet's `auth`) stays, so a page can still settle if the settler is behind.~~ **Superseded — removed.**
 - Reclaim after locktime stays as the last resort if every validator is gone.
 - Neither changes who can move funds: every escrow move still needs 3 of 4 validators.
 
@@ -100,7 +117,7 @@ A **settler** loop runs in the gateway after every committed block. Each move be
 - Each validator runs one long-lived `arena-frost serve` process (Rust), so a signing round starts no new processes.
 - The settler checks the mint's DLEQ proof on every new output before it records the settlement, and keeps a journal (`run/settle-journal.jsonl`) so a crash between the swap and the `settle` transaction is recovered from the mint (`/v1/checkstate`, `/v1/restore`), not lost. Failed attempts back off from 1 s up to 10 min.
 - Each pushed result goes to the page over the existing event stream as `{type: "settled", bid, to, proofs, ms, cosigners}`. A page that missed it collects the same ecash from the chain (`/api/bid?id=`). The page's pull claim runs only for a bid left unsettled for more than 10 s.
-- The re-lock trigger is the leading lock being less than `LockMarginSec / 2` away, as decided; anti-snipe locks are set to `now + LockMarginSec + 60`, fixed ones to `endAt + LockMarginSec + 15`.
+- ~~The re-lock trigger is the leading lock being less than `LockMarginSec / 2` away, as decided; anti-snipe locks are set to `now + LockMarginSec + 60`, fixed ones to `endAt + LockMarginSec + 15`.~~ **Superseded (v0.5.3):** no re-lock; a bid's lock derives from the end it establishes plus 915 s (`docs/PROTOCOL.md` §2). The page no longer collects pushed results over an SSE stream; it reads the relay facts (`docs/KINDS.md`).
 
 ### Speed (local run, 4 validators and the mint on one machine)
 
@@ -115,6 +132,11 @@ A **settler** loop runs in the gateway after every committed block. Each move be
 The 0.5 s goal is met by the settlement work itself (under 0.1 s). What is left is the block: a refund can only start once the outbidding bid is committed, and block timestamps are the proposer's clock, so the "after the block" figure also carries clock skew. The payout is pushed in the same second the clock reaches zero.
 
 ### Security points
+
+> **Superseded by the 2-of-2 increment (v0.5.3):** the escrow is now the
+> `[bidder, committee]` `SIG_ALL` lock; the committee **alone** cannot move an
+> escrow, and there is no re-lock and no pull release (`docs/PROTOCOL.md` §1,
+> §4, §5, §11). The points below describe v0.5.0 (group-key single-key escrow).
 
 - No validator, gateway or settler can move an escrow alone: every move is one signature from the FROST group key, which needs 3 of 4 key shares. All four shares still sit on one host in this demo (see the threat model); real separation needs four operators.
 - What the validators sign is fixed by the chain: refund to the bidder's own wallet key, payout to the seller's wallet key from the signed listing, re-lock to the same group key with the bidder's refund path. A settler that asks for anything else gets no signature (tests: forged outputs, wrong lock key, wrong amount, redirecting a settled escrow).

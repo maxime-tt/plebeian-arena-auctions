@@ -235,32 +235,146 @@ func sigAllTemplateSignOutputs(template sigAllSignedTemplate) ([]SignOutput, err
 	return outs, nil
 }
 
-// sigAllP2PKCondition is the NUT-10 P2PK body of an output secret.
-type sigAllP2PKCondition struct {
+// templateOutputCondition is the NUT-10 P2PK body of a settle/refund template
+// output. The field order is load-bearing: the canonical-form check re-marshals
+// this struct and compares the result with the committed bytes, so it must stay
+// the order the wallet emits (nonce, data, tags).
+type templateOutputCondition struct {
 	Nonce string     `json:"nonce"`
 	Data  string     `json:"data"`
 	Tags  [][]string `json:"tags"`
 }
 
-// sigAllOutputRecipient reads the destination key a template output is locked
-// to. The committee never chooses this; the bidder built it.
-func sigAllOutputRecipient(secret string) (string, error) {
-	var decoded []json.RawMessage
-	if err := json.Unmarshal([]byte(secret), &decoded); err != nil || len(decoded) != 2 {
-		return "", errors.New("template output secret is not a NUT-10 P2PK condition")
+// strictTemplateOutputSecret is the ONE parser for the destination of a settle
+// or refund template output. The mint reads the signer set of a NUT-11 P2PK
+// condition as [data] + tags["pubkeys"] with n_sigs, so any extra tag or a
+// differently-serialised body can mean one destination to a validator and
+// another to the mint. This refuses every such shape by name and returns the
+// compressed `data` point only when the secret is EXACTLY what the wallet
+// builds, byte for byte:
+//
+//	["P2PK",{"nonce":<32B lower hex>,"data":<compressed key>,"tags":[
+//	    ["sigflag","SIG_INPUTS"]]}]
+//
+// The tag list may also be empty (sigflag absent), which is the same
+// single-key, SIG_INPUTS-free condition. Everything else -- pubkeys, refund,
+// locktime, n_sigs != 1, duplicate tags, uppercase hex, escaped/reordered/
+// whitespace-padded JSON, extra fields -- is refused, because the mint would
+// read it differently.
+func strictTemplateOutputSecret(secret string) (string, error) {
+	var outer []json.RawMessage
+	if err := json.Unmarshal([]byte(secret), &outer); err != nil || len(outer) != 2 {
+		return "", errors.New("template output secret is not a NUT-10 [\"P2PK\",{...}] condition")
 	}
 	var kind string
-	if err := json.Unmarshal(decoded[0], &kind); err != nil || kind != "P2PK" {
-		return "", errors.New("template output secret is not a NUT-10 P2PK condition")
+	if err := json.Unmarshal(outer[0], &kind); err != nil || kind != "P2PK" {
+		return "", errors.New("template output secret is not a P2PK condition")
 	}
-	var condition sigAllP2PKCondition
-	if err := json.Unmarshal(decoded[1], &condition); err != nil {
-		return "", errors.New("template output secret is not a NUT-10 P2PK condition")
+	// Exactly the three NUT-10 fields, each at most once (strictObject also
+	// makes the key match case-sensitive, which the mint's JSON does).
+	obj, err := strictObject(outer[1], "nonce", "data", "tags")
+	if err != nil {
+		return "", fmt.Errorf("template output P2PK body is not exactly {nonce,data,tags}: %v", err)
 	}
-	if !isCompressedPub(condition.Data) {
-		return "", errors.New("template output is not locked to a compressed secp256k1 key")
+	for _, field := range []string{"nonce", "data", "tags"} {
+		if _, ok := obj[field]; !ok {
+			return "", fmt.Errorf("template output P2PK body is missing %q", field)
+		}
+	}
+	if string(obj["tags"]) == "null" {
+		return "", errors.New("template output tags must be a JSON array")
+	}
+	var condition templateOutputCondition
+	if err := json.Unmarshal(outer[1], &condition); err != nil {
+		return "", errors.New("template output P2PK body is malformed")
+	}
+	if !validLowerHex(condition.Nonce, 32) {
+		return "", errors.New("template output nonce is not 32 bytes of lowercase hex")
+	}
+	if !lowerHex(condition.Data, 66) || !isCompressedPub(condition.Data) {
+		return "", errors.New("template output data is not a lowercase compressed secp256k1 point")
+	}
+	seen := map[string]bool{}
+	for _, tag := range condition.Tags {
+		if len(tag) != 2 {
+			return "", fmt.Errorf("template output tag %q must have exactly one value", tag[0])
+		}
+		if seen[tag[0]] {
+			return "", fmt.Errorf("template output has duplicate tag %q", tag[0])
+		}
+		seen[tag[0]] = true
+		switch tag[0] {
+		case "pubkeys":
+			return "", errors.New("template output tags must not name additional pubkeys (the mint would let them spend it)")
+		case "n_sigs":
+			if tag[1] != "1" {
+				return "", fmt.Errorf("template output n_sigs must be 1, not %q", tag[1])
+			}
+		case "refund":
+			return "", errors.New("template output tags must not carry a refund path")
+		case "n_sigs_refund":
+			return "", errors.New("template output tags must not carry an n_sigs_refund tag")
+		case "locktime":
+			return "", errors.New("template output tags must not carry a locktime")
+		case "sigflag":
+			if tag[1] != "SIG_INPUTS" {
+				return "", fmt.Errorf("template output sigflag must be SIG_INPUTS, not %q", tag[1])
+			}
+		default:
+			return "", fmt.Errorf("template output tag %q is not allowed (only sigflag SIG_INPUTS may appear)", tag[0])
+		}
+	}
+	// Canonical form: re-marshalling the parsed structure must reproduce the
+	// committed secret byte for byte. Escaped, reordered, whitespace-padded or
+	// extra-field variants can then never read differently at the mint.
+	canonical, err := json.Marshal([]any{"P2PK", condition})
+	if err != nil || string(canonical) != secret {
+		return "", errors.New("template output secret is not canonical (whitespace, escapes, reordered keys/tags, uppercase hex or an extra field would read differently at the mint)")
 	}
 	return condition.Data, nil
+}
+
+// strictTemplateOutput refuses a settle/refund template output unless it is
+// the canonical single-key P2PK condition strictTemplateOutputSecret accepts
+// AND its data equals expectedKey in x-only form. Every path that admits,
+// verifies or signs a template uses this one function, so no two of them can
+// disagree about the destination.
+func strictTemplateOutput(secret, expectedKey string) error {
+	data, err := strictTemplateOutputSecret(secret)
+	if err != nil {
+		return err
+	}
+	dataX, err := xOnlyOf(data)
+	if err != nil {
+		return errors.New("template output data is not a compressed secp256k1 point")
+	}
+	expectedX, err := xOnlyOf(expectedKey)
+	if err != nil {
+		return fmt.Errorf("the committed destination is not a compressed secp256k1 point: %v", err)
+	}
+	if dataX != expectedX {
+		return errors.New("template output data is not locked to the committed destination key")
+	}
+	return nil
+}
+
+// sigAllOutputRecipient returns a template output's destination key after the
+// same strict parse. The V4V split matcher uses it to compare each settle
+// output against its committed row; it does not relax the shape, so a split
+// output cannot be reached through a form the settle verifier would refuse.
+func sigAllOutputRecipient(secret string) (string, error) {
+	return strictTemplateOutputSecret(secret)
+}
+
+// sigAllAmountPinned refuses a template output whose amount is not one of the
+// keyset's pinned denominations. The mint can only sign those, so an output of
+// any other amount could never settle -- it would be admitted and then strand
+// the escrow (the "denomination defect").
+func sigAllAmountPinned(amount int64, params Params) error {
+	if _, ok := params.Keys[fmt.Sprint(amount)]; !ok {
+		return fmt.Errorf("amount %d is not a pinned keyset denomination", amount)
+	}
+	return nil
 }
 
 // sigAllOutputIsEscrowRelock reports whether a template output re-locks the
@@ -278,7 +392,7 @@ func sigAllOutputIsEscrowRelock(secret, committeeKey string) bool {
 	if err := json.Unmarshal(decoded[0], &kind); err != nil || kind != "P2PK" {
 		return false
 	}
-	var condition sigAllP2PKCondition
+	var condition templateOutputCondition
 	if err := json.Unmarshal(decoded[1], &condition); err != nil {
 		return false
 	}
@@ -312,14 +426,20 @@ func verifySigAllBidderSignature(spendPublicKey, digestHex, signatureHex string)
 //	(a) the bid publishes no outcome_templates at all;
 //	(b) either template's inputs are not exactly the bid's committed proof
 //	    secrets, in the same order (the SIG_ALL inputs ARE the committed proofs);
-//	(c) either template's outputs do not sum to the bid's amount, or name a
-//	    keyset other than the pinned keyset_id;
+//	(c) either template's outputs name a keyset other than the pinned
+//	    keyset_id, use an amount that is not a pinned keyset denomination, or
+//	    (without a committed V4V split) do not sum to the bid's amount;
 //	(d) the settle outputs are not all locked to the auction's committed seller
-//	    payout key;
+//	    payout key (or, with a V4V split, to each committed row's recipient);
 //	(e) the refund outputs are not all locked to the bidder's wallet spend key;
 //	(f) either template's stored digest is not the one its inputs and outputs
 //	    derive;
 //	(g) either bidder signature does not verify over that digest.
+//
+// Every destination is read by strictTemplateOutput, the one parser the settle
+// verifier and the signing policy also use, so no two paths can disagree about
+// what an output pays (a tags-only difference would let the mint pay someone
+// else).
 //
 // An output that re-locks the escrow to the committee key is refused FIRST and
 // by name: it is forbidden outright (spec section 4), not merely a wrong
@@ -369,15 +489,40 @@ func verifySigAllBidTemplates(au *Auction, content *BidContent, params Params) e
 			// any generic amount check so an omitting, adding, reordering or
 			// repricing template is refused by its own name. The mint knows
 			// nothing about V4V -- this is the protocol rule (spec §6/§1.3).
-			if err := settleMatchesSplit(au, content.Amount, template, params.KeysetID); err != nil {
+			if err := settleMatchesSplit(au, content.Amount, template, params.KeysetID, params.Keys); err != nil {
 				return err
 			}
+			// Every split output is held to the same strict destination parser
+			// as a single-destination settle: the committed row's recipient is
+			// the only key that may appear, in the one canonical shape.
+			expected, err := splitSats(au.SellerWallet, au.V4VSplit, content.Amount, params.Keys)
+			if err != nil {
+				return fmt.Errorf("sigall settle template: %w", err)
+			}
+			if len(expected) != len(template.Outputs) {
+				return errors.New("sigall settle outputs do not match the committed v4v split")
+			}
+			for index, out := range template.Outputs {
+				if err := sigAllAmountPinned(out.Amount, params); err != nil {
+					return fmt.Errorf("sigall %s output %d: %w", e.name, index, err)
+				}
+				if sigAllOutputIsEscrowRelock(out.Secret, params.GroupKey) {
+					return fmt.Errorf("sigall %s output %d re-locks the escrow to the committee key, which is forbidden", e.name, index)
+				}
+				if err := strictTemplateOutput(out.Secret, expected[index].Recipient); err != nil {
+					return fmt.Errorf("sigall %s output %d: %w", e.name, index, err)
+				}
+			}
 		} else {
-			// (c) conserve the bid's amount and name the pinned keyset.
+			// (c) conserve the bid's amount, name the pinned keyset and use a
+			// denomination the mint can actually sign (the denomination defect).
 			var total int64
 			for index, out := range template.Outputs {
 				if out.Amount <= 0 {
 					return fmt.Errorf("sigall %s output %d has no positive amount", e.name, index)
+				}
+				if err := sigAllAmountPinned(out.Amount, params); err != nil {
+					return fmt.Errorf("sigall %s output %d: %w", e.name, index, err)
 				}
 				if out.Amount > (1<<62)-total {
 					return fmt.Errorf("sigall %s output amounts overflow", e.name)
@@ -391,12 +536,18 @@ func verifySigAllBidTemplates(au *Auction, content *BidContent, params Params) e
 				return fmt.Errorf("sigall %s outputs sum to %d, not the bid's amount %d", e.name, total, content.Amount)
 			}
 			// (d) settle and (e) refund: every output locked to the one committed
-			// destination, never to the committee key; and a REFUND must not pay
-			// a committed V4V split row (refunds stay bidder-only, spec §6).
+			// destination through the SAME strict parser the settle verifier and
+			// the signing policy use, never to the committee key; and a REFUND
+			// must not pay a committed V4V split row (refunds stay bidder-only,
+			// spec §6).
 			for index, out := range template.Outputs {
 				if sigAllOutputIsEscrowRelock(out.Secret, params.GroupKey) {
 					return fmt.Errorf("sigall %s output %d re-locks the escrow to the committee key, which is forbidden", e.name, index)
 				}
+				// Parse the shape once, then apply the refund-specific check on
+				// the key actually committed in the output before the generic
+				// destination comparison (so a refund that pays a split row is
+				// named as exactly that, not as a wrong destination).
 				recipient, err := sigAllOutputRecipient(out.Secret)
 				if err != nil {
 					return fmt.Errorf("sigall %s output %d: %w", e.name, index, err)
@@ -404,11 +555,8 @@ func verifySigAllBidTemplates(au *Auction, content *BidContent, params Params) e
 				if e.name == "refund" && isSplitRecipient(au, recipient) {
 					return fmt.Errorf("sigall refund output %d pays a committed v4v split recipient", index)
 				}
-				if !sameKey(recipient, e.dest) {
-					if e.name == "settle" {
-						return fmt.Errorf("sigall settle output %d is not locked to the auction's committed seller payout key", index)
-					}
-					return fmt.Errorf("sigall refund output %d is not locked to the bid's wallet spend key", index)
+				if err := strictTemplateOutput(out.Secret, e.dest); err != nil {
+					return fmt.Errorf("sigall %s output %d: %w", e.name, index, err)
 				}
 			}
 		}

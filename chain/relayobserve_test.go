@@ -179,6 +179,8 @@ func newChainHarness(t *testing.T) *chainHarness {
 		MinWindowSec: 60, MaxWindowSec: 900,
 		SettlementSafetySec: 900, BidToConsensusLatencySec: 15,
 		MinDurationSec: 20, MaxDurationSec: 259200, MaxProofs: 64, Threshold: 3,
+		// The committed mint a root create must name (spec §3.6, handover §6.4).
+		MintURL: testMintAddr,
 	}
 	raw, _ := json.Marshal(params)
 	if _, err := app.InitChain(context.Background(), &abci.InitChainRequest{AppStateBytes: raw}); err != nil {
@@ -309,8 +311,10 @@ func signedCreate(t *testing.T, secret, title string, createdAt int64) nostr.Eve
 		"sellerWallet": "02" + repeat("33", 32), "name": "seller",
 		// v0.5.0 modes (ADR 0009) and the allow-list: a create must name a
 		// mode, and its `d` tag is what makes it addressable as an auction
-		// root — without one, applyCreate refuses it.
-		"mode": "fixed",
+		// root — without one, applyCreate refuses it.  The mint is the one the
+		// chain commits in Params (spec §3.6, handover §6.4): a root create
+		// that does not name it is refused by name.
+		"mode": "fixed", "mintUrl": testMintAddr,
 	})
 	event := nostr.Event{
 		PubKey:    pub,

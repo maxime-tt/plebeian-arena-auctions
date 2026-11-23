@@ -102,6 +102,12 @@ export class ArenaClient {
     this.mintUrl = (base || (typeof location !== 'undefined' ? location.origin : '')) + '/mint';
     this.cocos = new Map();
     this.signers = new Map(); // pubkey -> async (template) => signed event, for remote signers
+    // The last committed Params a state() read returned. A create must name the
+    // trusted mint, and a seller may publish it to the relay while every
+    // validator is down (the restart-ingest path), so the create cannot depend
+    // on a live /api/state at that moment. Params.MintURL is committed and
+    // stable for the life of a chain root; a wipe starts a new root.
+    this.paramsCache = null;
   }
 
   async j(path, opts) {
@@ -112,7 +118,11 @@ export class ArenaClient {
     return body;
   }
 
-  state() { return this.j('/api/state'); }
+  async state() {
+    const s = await this.j('/api/state');
+    if (s && s.params) this.paramsCache = s.params;
+    return s;
+  }
   // Slim view the page polls (v0.3.1): open lots, recent results and the
   // caller's unsettled ones, bids without proofs. Resolves to null when the
   // view is unchanged since etag (HTTP 304).
@@ -243,8 +253,16 @@ export class ArenaClient {
     // not supply it. NIP-01 charset [A-Za-z0-9_-], 1..64 chars.
     if (!d) d = bytesToHex(randomBytes(12));
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(d)) throw new Error('auction d must be 1..64 of [A-Za-z0-9_-]');
+    // The chain accepts a ROOT create only if it names the mint the chain
+    // trusts (spec §3.6/§3.7), so a caller that did not name one gets the
+    // committed mint injected. Prefer the last committed Params this client
+    // read: a create may be published to the relay while every validator is
+    // down, and the chain then ingests it on restart (no live state call). Only
+    // a client that has never read state fetches it now; that failure
+    // propagates, because without the committed mint no create is acceptable.
+    const body = lot.mintUrl ? lot : { ...lot, mintUrl: (this.paramsCache || (await this.state()).params).mintUrl };
     const coord = `${KIND_CREATE}:${idPub(id)}:${d}`;
-    const ev = await this.sign(id, KIND_CREATE, { ...lot, sellerWallet: walletPub(id), name: lot.name || id.name }, [['d', d]]);
+    const ev = await this.sign(id, KIND_CREATE, { ...body, sellerWallet: walletPub(id), name: lot.name || id.name }, [['d', d]]);
     const res = await this.submit(ev);
     return { ...res, id: ev.id, rootId: ev.id, d, coord };
   }
@@ -282,7 +300,13 @@ export class ArenaClient {
   // minBidLocktime above.
   async lockForBid(id, amount, params, auction, { force = false, state, now = Date.now() / 1000 } = {}) {
     if (!force) {
-      const min = auction.highBid ? auction.highAmount + auction.minIncrement : auction.startPrice;
+      // The chain's admission rule is a raise of MinIncrementBps of the current
+      // top (default 200 = 2%, at least 1 sat); the create-side minIncrement is
+      // only the instance minimum. Mirror the chain so the client never offers a
+      // bid the chain would refuse.
+      const bps = Number(params?.minIncrementBps ?? 200);
+      const raise = Math.max(1, Math.ceil((auction.highAmount || 0) * bps / 10000));
+      const min = auction.highBid ? auction.highAmount + raise : auction.startPrice;
       if (auction.status !== 'open') throw new Error('auction closed');
       if (amount < min) throw new Error(`bid must be at least ${min} sats`);
       if (state && auction.highBid && state.bids[auction.highBid].bidder === idPub(id)) throw new Error('you are already the highest bidder');
