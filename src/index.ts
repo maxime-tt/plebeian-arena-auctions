@@ -77,6 +77,13 @@ class Facilitator {
   private readonly completed = new Map<string, SettlementCarrierContent>();
   private readonly keysCache = new Map<string, Record<string, string>>();
   private readonly processing = new Set<string>();
+  /**
+   * 1451s whose anchor is not yet provable from the 1447 commitments we have seen. The
+   * coordinator anchors at its OWN committed height, so a fact can arrive one or two blocks
+   * ahead of our view; dropping it would stall a settlement nobody else retries. Each new
+   * commitment re-checks them.
+   */
+  private readonly pendingAnchors = new Map<string, NostrEvent>();
 
   constructor(
     private readonly cfg: Config,
@@ -108,6 +115,15 @@ class Facilitator {
     } catch {
       /* ignore a malformed commitment; it is only a clock/anchor hint */
     }
+    // A new committed height may make a stashed 1451 provable; re-dispatch each pending fact
+    // (it is re-stashed if it still is not).
+    if (this.pendingAnchors.size > 0) {
+      const pending = [...this.pendingAnchors.entries()];
+      this.pendingAnchors.clear();
+      for (const [, event] of pending) {
+        void this.onCommittee(event).catch((err) => log("pending 1451 handler error:", (err as Error).message));
+      }
+    }
   }
 
   private async onCommittee(ev: NostrEvent): Promise<void> {
@@ -123,6 +139,12 @@ class Facilitator {
     const key = `${content.bid}|${content.outcome}`;
     const anchor = anchorRefusal(content, this.commitments);
     if (anchor !== null) {
+      if (anchor.startsWith("anchor: 1451 height")) {
+        // Not WRONG, just not yet provable: our own committed view lags the coordinator's by a
+        // block or so. Keep it and re-check on the next commitment.
+        this.pendingAnchors.set(`${content.bid}|${content.outcome}`, ev);
+        return;
+      }
       log("drop 1451:", anchor);
       return;
     }
