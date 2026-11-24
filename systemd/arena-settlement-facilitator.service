@@ -1,0 +1,24 @@
+[Unit]
+Description=Arena settlement facilitator (optional settlement courier)
+Documentation=file:/opt/arena-settlement-facilitator/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/arena-settlement-facilitator
+Environment=SF_CONFIG=/etc/arena-settlement-facilitator/config.json
+# Optional: a stable courier key for the kind-1452 `p` tag. It authors nothing
+# authoritative, so leaving it unset (ephemeral key) is fine.
+# EnvironmentFile=-/etc/arena-settlement-facilitator/env
+ExecStart=/home/%u/.bun/bin/bun src/index.ts
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+{
+  "mintUrl": "https://mint.example.com",
+  "relays": [
+    "wss://relay.example.com"
+  ],
+  "committeeGroupPubkey": "0000000000000000000000000000000000000000000000000000000000000000",
+  "validatorRoster": [
+    "0000000000000000000000000000000000000000000000000000000000000000"
+  ],
+  "pollIntervalMs": 5000,
+  "clockToleranceSec": 30,
+  "fallbackMarginSec": 60,
+  "estimatedSwapSeconds": 10,
+  "requestTimeoutMs": 15000
+}
