@@ -74,6 +74,41 @@ describe("planSwap", () => {
     const res = planSwap({ committee: f.committee, bid, create: f.create, committeeGroupPubkey: f.keys.committeeXOnly });
     expect(res.ok).toBe(false);
   });
+
+  it("plans a settle whose committed V4V split pays the seller and a row recipient", () => {
+    const splitRecipient = "02" + "33".repeat(32);
+    const f = makeSettleFixture({ splitRecipient });
+    const p = plan(f);
+    expect(p.outcome).toBe("settle");
+    expect(p.outputs).toHaveLength(2);
+    // Each output keeps its own committed lock, not one key per index.
+    expect(p.recipients).toHaveLength(2);
+    expect(p.recipients[0]).toBe(f.create.sellerWallet);
+    expect(p.recipients[1]).toBe(splitRecipient);
+    const body = buildSwapBody(p);
+    expect(body.outputs.map((o) => ({ amount: o.amount, B_: o.B_ }))).toEqual(recomputeOutputs(f.settleOutputs));
+    const w = JSON.parse(body.inputs[0]!.witness!) as { signatures: string[] };
+    expect(w.signatures).toEqual([p.bidderSignature, p.committeeSignature]);
+  });
+
+  it("declines a split row that names no recipient", () => {
+    const f = makeSettleFixture({ splitRecipient: "02" + "33".repeat(32) });
+    const create = structuredClone(f.create);
+    create.v4vSplit = [{ role: "v4v", recipientPubkey: "", allocationBps: 5000 }];
+    const res = planSwap({ committee: f.committee, bid: f.bid, create, committeeGroupPubkey: f.keys.committeeXOnly });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/split row names no recipient/);
+  });
+
+  it("declines a template output that is not locked to an allowed destination", () => {
+    const f = makeSettleFixture();
+    // The committed seller payout key is not the one the outputs lock to:
+    // recomputed B_ and digest still line up, so it is refused at the lock check.
+    const create = { ...f.create, sellerWallet: "03" + "44".repeat(32) };
+    const res = planSwap({ committee: f.committee, bid: f.bid, create, committeeGroupPubkey: f.keys.committeeXOnly });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/not locked to an allowed committed destination/);
+  });
 });
 
 describe("buildSwapBody (contract §4)", () => {

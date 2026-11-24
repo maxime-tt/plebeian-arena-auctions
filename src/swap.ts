@@ -11,8 +11,6 @@
 
 import { hexToBytes } from "@noble/hashes/utils.js";
 import {
-  outputBPoint,
-  outputRecipient,
   parseP2PK,
   recomputeOutputs,
   schnorrVerifyDigest,
@@ -96,27 +94,29 @@ function checkEscrowLock(
 }
 
 /**
- * The committed destination of each template output. Returns one entry per
- * output. A settle with a committed V4V split needs the chain's denomination
- * splitter to reproduce per-row amounts, which this courier does not implement;
- * it refuses rather than guess a destination (the recipient's wallet can still
- * execute that template).
+ * The set of keys a committed template output may pay for this outcome. A
+ * refund pays the bidder; a plain settle pays the seller; a split settle pays
+ * any of the seller or a committed V4V row's recipient. Each template output's
+ * own P2PK secret names its lock and carries its own blinding factor, so no
+ * denomination splitter is needed — the courier only checks the lock is one of
+ * the committed destinations (contract §5).
  */
-function committedDestinations(
+function allowedDestinations(
   bid: BidContent,
   create: CreateContent,
   outcome: "settle" | "refund",
-  outputCount: number,
-): { destinations: string[] } | { reason: string } {
+): { allowed: string[] } | { reason: string } {
   if (outcome === "refund") {
     if (!bid.wallet) return { reason: "bid committed no wallet spend key" };
-    return { destinations: new Array(outputCount).fill(bid.wallet) };
-  }
-  if (create.v4vSplit && create.v4vSplit.length > 0) {
-    return { reason: "settle with a committed V4V split is not supported by the courier" };
+    return { allowed: [bid.wallet] };
   }
   if (!create.sellerWallet) return { reason: "auction committed no seller payout key" };
-  return { destinations: new Array(outputCount).fill(create.sellerWallet) };
+  const allowed = [create.sellerWallet];
+  for (const row of create.v4vSplit ?? []) {
+    if (!row.recipientPubkey) return { reason: "committed V4V split row names no recipient" };
+    allowed.push(row.recipientPubkey);
+  }
+  return { allowed };
 }
 
 /**
@@ -197,17 +197,21 @@ export function planSwap(args: {
     return refuse("committee signature does not verify on the reconstructed digest");
   }
 
-  // Destinations: every output pays the committed key for its index.
-  const dests = committedDestinations(bid, create, outcome, template.outputs.length);
-  if ("reason" in dests) return refuse(dests.reason);
-  const recipients = dests.destinations;
+  // Destinations: every output locks to one of the committed destinations. The
+  // plan keeps each output's own lock so `settle.ts` still checks the unblinded
+  // receipt against it; no single key per index is assumed.
+  const allowed = allowedDestinations(bid, create, outcome);
+  if ("reason" in allowed) return refuse(allowed.reason);
+  if (allowed.allowed.length === 0) return refuse("no committed destination is allowed for this outcome");
+  const allowedXOnly = new Set(allowed.allowed.map(xOnly));
+  const recipients: string[] = [];
   for (let j = 0; j < template.outputs.length; j++) {
-    const recipient = outputRecipient(template.outputs[j]!.secret);
-    if (recipient === null) return refuse(`template output ${j} is not a plain P2PK condition`);
-    const expected = recipients[j]!;
-    if (!sameHex(xOnly(recipient), xOnly(expected))) {
-      return refuse(`template output ${j} is not locked to the committed destination`);
+    const lock = parseP2PK(template.outputs[j]!.secret);
+    if (!lock) return refuse(`template output ${j} is not a plain P2PK condition`);
+    if (!allowedXOnly.has(xOnly(lock.data))) {
+      return refuse(`template output ${j} is not locked to an allowed committed destination`);
     }
+    recipients.push(lock.data);
   }
 
   // The witness rides on inputs[0] only (contract §4): bidder first, committee second.

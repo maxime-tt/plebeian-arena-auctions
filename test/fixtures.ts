@@ -88,20 +88,24 @@ export interface Fixture {
  * from the committed inputs and outputs with the project's own `sigall`
  * helpers, then signed with the bidder and committee keys.
  */
-export function makeSettleFixture(overrides: { locktime?: number } = {}): Fixture {
+export function makeSettleFixture(overrides: { locktime?: number; splitRecipient?: string } = {}): Fixture {
   const keys = makeKeys();
   const locktime = overrides.locktime ?? Math.floor(Date.now() / 1000) + 3600;
   const sellerWallet = randPoint();
+  const splitRecipient = overrides.splitRecipient;
+  const destinations = splitRecipient ? [sellerWallet, splitRecipient] : [sellerWallet, sellerWallet];
 
   const escrowProofs: EscrowProof[] = [
     { id: KEYSET_ID, amount: 64, secret: escrowSecret(keys, locktime), C: randPoint() },
     { id: KEYSET_ID, amount: 32, secret: escrowSecret(keys, locktime), C: randPoint() },
   ];
 
-  const settleOutputs: TemplateOutput[] = [
-    { amount: 64, id: KEYSET_ID, secret: destinationSecret(sellerWallet), r: bytesToHex(randScalar()) },
-    { amount: 32, id: KEYSET_ID, secret: destinationSecret(sellerWallet), r: bytesToHex(randScalar()) },
-  ];
+  const settleOutputs: TemplateOutput[] = destinations.map((dest, i) => ({
+    amount: i === 0 ? 64 : 32,
+    id: KEYSET_ID,
+    secret: destinationSecret(dest),
+    r: bytesToHex(randScalar()),
+  }));
 
   const inputs = escrowProofs.map((p) => ({
     amount: p.amount,
@@ -138,6 +142,9 @@ export function makeSettleFixture(overrides: { locktime?: number } = {}): Fixtur
     outcome_templates: { settle, refund },
   };
   const create: CreateContent = { sellerWallet };
+  if (splitRecipient) {
+    create.v4vSplit = [{ role: "v4v", recipientPubkey: splitRecipient, allocationBps: 5000 }];
+  }
 
   const content: CommitteeSignatureContent = {
     schema: "arena.committee_signature.v1",
