@@ -303,9 +303,17 @@ func (s *State) verifySettle(st *settleTx, now int64) (*settleCheck, error) {
 			return nil, err
 		}
 		// The new proof must be the committed template's own output: same
-		// secret, and it must blind to the committed blinded point.
+		// secret, the committed amount, and it must blind to the committed
+		// blinded point. The amount check is NOT redundant: B_ = H(secret) + r*G
+		// does not depend on the amount, so without it a courier could mint a
+		// smaller-denomination proof for the committed (secret, r), have the
+		// chain record a fraction of the payout, and let the bidder reclaim the
+		// untouched escrow after locktime.
 		if pr.Secret != template.Outputs[i].Secret {
 			return nil, errors.New("outcome proof is not the committed template's output")
+		}
+		if pr.Amount != outs[i].Amount {
+			return nil, errors.New("outcome proof amount is not the committed template output's amount")
 		}
 		b, err := blinded(pr.Secret, pr.DLEQ.R)
 		if err != nil {

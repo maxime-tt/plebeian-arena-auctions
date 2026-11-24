@@ -12,7 +12,9 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -73,6 +75,86 @@ func TestDueOutcomeSignsWithZeroHTTPToApiSettle(t *testing.T) {
 	if !signed[ev1.ID+"|refund"] {
 		t.Fatal("the (bid, outcome) must be recorded as signed")
 	}
+}
+
+// TestSettleRefusesProofAmountNotInTheCommittedTemplate pins the amount binding
+// in verifySettle. Once a 1451 committee signature is public, anyone can mint a
+// proof for the committed (secret, r) — `B_ = H(secret) + r*G` carries no amount
+// — under a smaller denomination and carry it as a settlement. Without the
+// binding the chain would record a fraction of the payout as settled and leave
+// the untouched escrow refundable to the bidder after locktime.
+func TestSettleRefusesProofAmountNotInTheCommittedTemplate(t *testing.T) {
+	a, m, _, ev1 := dueRefundApp(t)
+	bid := a.st.Bids[ev1.ID]
+	template, outs, err := a.st.settlementOutputs(bid, "refund")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same committed blinded point, under a different pinned denomination.
+	other := otherPinnedAmount(t, a.st.Params.Keys, outs[0].Amount)
+	forged := append([]SignOutput(nil), outs...)
+	forged[0] = SignOutput{Amount: other, ID: outs[0].ID, B: outs[0].B}
+
+	proofs := make([]Proof, len(forged))
+	for i, o := range forged {
+		bs := m.blindSign(t, o)
+		A, err := parsePub(a.st.Params.Keys[strconv.FormatInt(o.Amount, 10)])
+		if err != nil {
+			t.Fatal(err)
+		}
+		Cb, err := parsePub(bs.C_)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := parseScalar(template.Outputs[i].R)
+		if err != nil {
+			t.Fatal(err)
+		}
+		C := add(Cb, neg(mul(r, A)))
+		pr := Proof{ID: o.ID, Amount: o.Amount, Secret: template.Outputs[i].Secret,
+			C:    hex.EncodeToString(C.SerializeCompressed()),
+			DLEQ: &DLEQ{E: bs.DLEQ.E, S: bs.DLEQ.S, R: template.Outputs[i].R}}
+		if err := verifyDLEQ(pr, A); err != nil {
+			t.Fatalf("the forged proof must be a real mint signature for its own amount: %v", err)
+		}
+		proofs[i] = pr
+	}
+	// The committee signature is the honest, committed one: it covers the
+	// template's amounts, which is exactly why the amount must be checked.
+	st := &settleTx{Bid: ev1.ID, Outcome: "refund", Proofs: proofs, Sig: groupSign(t, sigAllMessage(bid.Proofs, outs))}
+
+	_, err = a.st.verifySettle(st, tNow+2)
+	if err == nil {
+		t.Fatal("a proof whose amount is not the committed template's must be refused")
+	}
+	if !strings.Contains(err.Error(), "amount") {
+		t.Fatalf("refusal = %v, want the amount binding", err)
+	}
+	if r := finalize(t, a, 12, tNow+2, makeSettle(st)); r.TxResults[0].Code == 0 {
+		t.Fatal("a forged-amount settle must not commit")
+	}
+	if a.st.Bids[ev1.ID].Settled != "" {
+		t.Fatal("a forged-amount settle must not record a settlement")
+	}
+}
+
+// otherPinnedAmount returns the smallest pinned denomination other than not.
+func otherPinnedAmount(t *testing.T, keys map[string]string, not int64) int64 {
+	t.Helper()
+	best := int64(-1)
+	for k := range keys {
+		v, err := strconv.ParseInt(k, 10, 64)
+		if err != nil || v == not {
+			continue
+		}
+		if best == -1 || v < best {
+			best = v
+		}
+	}
+	if best == -1 {
+		t.Fatal("keyset has no denomination other than the template's")
+	}
+	return best
 }
 
 // TestAggregateForAnotherDigestIsNotPublished: a round that aggregates a
