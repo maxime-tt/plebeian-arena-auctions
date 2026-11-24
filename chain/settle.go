@@ -13,14 +13,13 @@ package main
 // committee key would hand the committee a spendable output (spec §4), and a
 // long lock freezes only the bidder's own funds (spec §2.3).
 //
-// The settler is an EXECUTOR, not an author (spec §5): the outputs are already
-// fixed by the bidder's signature in the committed template, so the settler
-// builds nothing and chooses nothing. Every validator re-derives the committed
-// template's outputs from its own copy of the chain and signs that exact
-// digest; the settler submits the template's own outputs with the bidder's
-// pre-signature plus the collected committee signature. The mint only accepts
-// the two transactions the bidder pre-signed, and the tx is recorded on chain
-// so a diversion would be provable.
+// The chain does not move escrow: it commits the outcome, and the elected
+// coordinator validator signs the committed template's digest, publishing the
+// committee signature as kind 1451. An executor -- the facilitator, or the
+// recipient's own wallet -- performs the mint swap and carries the result back
+// as kind 1452, which becomes a settle tx here. The mint only accepts the two
+// transactions the bidder pre-signed, and the tx is recorded on chain so a
+// diversion would be provable.
 
 import (
 	"bytes"
@@ -370,8 +369,9 @@ func (s *State) applySettle(st *settleTx, v *settleCheck) {
 	}
 }
 
-// dueMove is one escrow the settler should move now: it names the committed
-// outcome template to submit, never any output.
+// dueMove is one escrow whose committed outcome is due now: it names the
+// committed outcome template, never any output. The coordinator's signing pass
+// consumes it; the chain itself moves nothing.
 type dueMove struct {
 	Bid     *Bid   `json:"bid"`
 	Outcome string `json:"outcome"`

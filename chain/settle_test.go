@@ -97,7 +97,7 @@ func mintMove(t *testing.T, a *App, m *testMint, bidID, outcome, to string, now 
 		}
 		C := add(Cb, neg(mul(r, A)))
 		pr := Proof{ID: o.ID, Amount: o.Amount, Secret: template.Outputs[i].Secret,
-			C: hex.EncodeToString(C.SerializeCompressed()),
+			C:    hex.EncodeToString(C.SerializeCompressed()),
 			DLEQ: &DLEQ{E: bs.DLEQ.E, S: bs.DLEQ.S, R: template.Outputs[i].R}}
 		if err := verifyDLEQ(pr, A); err != nil {
 			t.Fatalf("mint DLEQ: %v", err)

@@ -53,7 +53,14 @@ func TestDueOutcomeSignsWithZeroHTTPToApiSettle(t *testing.T) {
 	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 2 })
 	myKey := newBidder(t).pub
 	validators := []ValidatorKey{{Pubkey: myKey}}
-	signer := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: strings.Repeat("ab", 64)}}
+	// The pass refuses an aggregate that does not cover this node's committed
+	// digest, so the fake signer returns a real group signature over it.
+	bid := a.st.Bids[ev1.ID]
+	_, outs, err := a.st.settlementOutputs(bid, "refund")
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: groupSign(t, sigAllMessage(bid.Proofs, outs))}}
 	signed := map[string]bool{}
 	settlementTick(a, pub, signer, validators, myKey, signed)
 
@@ -68,6 +75,29 @@ func TestDueOutcomeSignsWithZeroHTTPToApiSettle(t *testing.T) {
 	}
 }
 
+// TestAggregateForAnotherDigestIsNotPublished: a round that aggregates a
+// message other than this node's committed digest must not produce a 1451 —
+// the fact would carry a digest its own signature does not cover.
+func TestAggregateForAnotherDigestIsNotPublished(t *testing.T) {
+	a, _, _, ev1 := dueRefundApp(t)
+	rec := &recordingRelay{}
+	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 2 })
+	myKey := newBidder(t).pub
+	validators := []ValidatorKey{{Pubkey: myKey}}
+	signed := map[string]bool{}
+
+	// A valid group signature, but over a different message.
+	bad := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: groupSign(t, "another message entirely")}}
+	settlementTick(a, pub, bad, validators, myKey, signed)
+
+	if got := len(eventsOfKind(rec, KindCommitteeSignature)); got != 0 {
+		t.Fatalf("an aggregate over another digest published %d events, want 0", got)
+	}
+	if signed[ev1.ID+"|refund"] {
+		t.Fatal("an inconsistent aggregate must not mark the outcome signed")
+	}
+}
+
 // TestRestartMidRoundDoesNotRepublishAggregate: the first round is interrupted
 // before an aggregate is published (the signer refuses).  A restart runs the
 // pass again and publishes exactly one aggregate; a further tick does not
@@ -79,6 +109,11 @@ func TestRestartMidRoundDoesNotRepublishAggregate(t *testing.T) {
 	myKey := newBidder(t).pub
 	validators := []ValidatorKey{{Pubkey: myKey}}
 	signed := map[string]bool{}
+	bid := a.st.Bids[ev1.ID]
+	_, outs, err := a.st.settlementOutputs(bid, "refund")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	fail := &fakeCommitteeSigner{code: 500, res: releaseResult{Error: "mesh down"}}
 	settlementTick(a, pub, fail, validators, myKey, signed)
@@ -89,7 +124,7 @@ func TestRestartMidRoundDoesNotRepublishAggregate(t *testing.T) {
 		t.Fatal("a failed round must not mark the outcome signed")
 	}
 
-	ok := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: strings.Repeat("cd", 64)}}
+	ok := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: groupSign(t, sigAllMessage(bid.Proofs, outs))}}
 	settlementTick(a, pub, ok, validators, myKey, signed)
 	if got := len(eventsOfKind(rec, KindCommitteeSignature)); got != 1 {
 		t.Fatalf("after restart published %d events, want 1", got)

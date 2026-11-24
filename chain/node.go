@@ -833,6 +833,16 @@ func settlementTick(app *App, pub *Publisher, signer committeeSigner, validators
 			Digest: committeeSignatureDigest(inputs, outputs), Signature: res.Signature,
 			Inputs: inputs, Outputs: outputs,
 		}
+		// The round's message is the one at least three validators computed; it
+		// must be THIS node's committed digest, or the published fact would carry
+		// a digest its own signature does not cover. Refuse rather than publish an
+		// inconsistent fact (a peer with different committed state is a bug, not a
+		// reason to sign someone else's message).
+		h := sha256Sum(sigAllMessage(move.Bid.Proofs, outs))
+		if !schnorrVerifyHash(h[:], st.Params.GroupKey, res.Signature) {
+			log.Printf("settlement signer: %s %s: aggregate does not cover the committed digest", move.Bid.ID, move.Outcome)
+			continue
+		}
 		if err := pub.PublishCommitteeSignature(context.Background(), content); err != nil {
 			log.Printf("settlement signer: publish %s %s: %v", move.Bid.ID, move.Outcome, err)
 			continue

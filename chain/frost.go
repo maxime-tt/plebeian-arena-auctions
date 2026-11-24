@@ -310,14 +310,15 @@ func signingPackageMessage(sp json.RawMessage) (string, error) {
 	return strings.ToLower(p.Message), nil
 }
 
-// releaseCoordinator runs a FROST signing round for the gateway. It holds no
-// key material: it only relays commitments and shares, then aggregates them
-// into one BIP-340 signature with the public key package from genesis.
+// releaseCoordinator runs a FROST signing round for the elected validator
+// node. It holds no key material: it only relays commitments and shares, then
+// aggregates them into one BIP-340 signature with the public key package from
+// genesis.
 type releaseCoordinator struct {
 	pkp      json.RawMessage
 	groupKey string
 	post     func(i int, path string, body any, out any) (int, error)
-	params   Params // genesis app state: keyset, lock margin (for the settler)
+	params   Params // genesis app state: the roster the election reads, and the keyset
 }
 
 func loadCoordinator(root string, post func(int, string, any, any) (int, error)) (*releaseCoordinator, error) {

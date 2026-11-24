@@ -30,8 +30,7 @@ type eventHub struct {
 	wake   chan struct{}
 	// committed height from the first running validator; after is the
 	// height already seen, so a source may long-poll until it moves (v0.5.0)
-	src     func(after int64) (int64, bool)
-	onBlock func(int64) // the settler: told about every new height, listeners or not
+	src func(after int64) (int64, bool)
 }
 
 func newEventHub(src func(after int64) (int64, bool)) *eventHub {
@@ -40,43 +39,16 @@ func newEventHub(src func(after int64) (int64, bool)) *eventHub {
 	return h
 }
 
-// watch makes the hub follow the chain even with no listeners and call f on
-// every new height.
-func (h *eventHub) watch(f func(int64)) {
-	h.mu.Lock()
-	h.onBlock = f
-	h.mu.Unlock()
-	select {
-	case h.wake <- struct{}{}:
-	default:
-	}
-}
-
-// broadcast sends one message (a JSON object) to every listener; a listener
-// too slow to take it misses it and falls back to polling.
-func (h *eventHub) broadcast(msg []byte) {
-	b := []byte("data: " + string(msg) + "\n\n")
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, m := range h.subs {
-		select {
-		case m <- b:
-		default:
-		}
-	}
-}
-
-// run follows the validators only while someone is listening (or the
-// settler watches). The source long-polls, so this is one waiting request,
-// not ten a second; a source that answers at once is paced at ssePoll.
+// run follows the validators only while someone is listening. The source
+// long-polls, so this is one waiting request, not ten a second; a source that
+// answers at once is paced at ssePoll.
 func (h *eventHub) run() {
 	for {
 		h.mu.Lock()
 		n := len(h.subs)
-		watched := h.onBlock != nil
 		last := h.height
 		h.mu.Unlock()
-		if n == 0 && !watched {
+		if n == 0 {
 			<-h.wake
 			continue
 		}
@@ -91,11 +63,7 @@ func (h *eventHub) run() {
 			}
 		}
 		h.mu.Lock()
-		f := h.onBlock
 		if ht != h.height {
-			if f != nil && ht > h.height {
-				go f(ht)
-			}
 			h.height = ht
 			for c := range h.subs {
 				select { // latest wins: drop a stale value a slow reader has not taken
@@ -115,7 +83,7 @@ func (h *eventHub) subscribe() (chan int64, int64, bool) {
 	if len(h.subs) >= sseMaxSubs {
 		return nil, 0, false
 	}
-	if len(h.subs) == 0 && h.onBlock == nil {
+	if len(h.subs) == 0 {
 		// The hub stops polling while nobody listens, so the height it kept is
 		// stale: the first listener waits for the next poll (100 ms) instead.
 		h.height = 0
