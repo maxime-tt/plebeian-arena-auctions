@@ -59,6 +59,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -78,6 +79,13 @@ const (
 	RefundSchema = "arena.refund.v1"
 	// SettleSchema is the content schema of a kind-1444 settle receipt.
 	SettleSchema = "arena.settle.v1"
+	// CommitteeSignatureSchema is the content schema of a kind-1451 committee
+	// signature: the elected coordinator's FROST aggregate over one committed
+	// outcome's SIG_ALL digest, plus the aggregation inputs an executor needs.
+	CommitteeSignatureSchema = "arena.committee_signature.v1"
+	// SettlementCarrierSchema is the content schema of a kind-1452 settlement
+	// carrier: exactly the existing settleTx payload, carried by any courier.
+	SettlementCarrierSchema = "arena.settlement.v1"
 	// DerivedFromCommittedState states the determinism claim ON THE WIRE: the
 	// outcome is a pure function of committed state, not a validator opinion.
 	DerivedFromCommittedState = "committed_state"
@@ -109,34 +117,43 @@ const (
 // Named refusals.  A client ignores an unanchored verdict; naming the refusal
 // lets a test assert exactly which rule fired.
 var (
-	ErrVerdictKind                  = errors.New("not_a_verdict_event")
-	ErrVerdictBadSchema             = errors.New("bad_verdict_schema")
-	ErrVerdictUnanchored            = errors.New("unanchored_verdict")
-	ErrVerdictBadSignature          = errors.New("bad_verdict_signature")
-	ErrVerdictNotInRoster           = errors.New("verdict_not_in_roster")
-	ErrCommitmentKind               = errors.New("not_a_state_commitment")
-	ErrCommitmentBadSchema          = errors.New("bad_state_commitment_schema")
-	ErrCommitmentBadSignature       = errors.New("bad_state_commitment_signature")
-	ErrCommitmentUnanchored         = errors.New("unanchored_state_commitment")
-	ErrPulseKind                    = errors.New("not_a_state_pulse")
-	ErrPulseBadSchema               = errors.New("bad_state_pulse_schema")
-	ErrPulseBadSignature            = errors.New("bad_state_pulse_signature")
-	ErrPulseUnanchored              = errors.New("unanchored_state_pulse")
-	ErrPulseNotInRoster             = errors.New("state_pulse_not_in_roster")
-	ErrParamsKind                   = errors.New("not_a_params_event")
-	ErrParamsBadSchema              = errors.New("bad_params_schema")
-	ErrParamsBadSignature           = errors.New("bad_params_signature")
-	ErrParamsUnanchored             = errors.New("unanchored_params_event")
-	ErrParamsNotInRoster            = errors.New("params_not_in_roster")
-	ErrReceiptKind                  = errors.New("not_a_receipt_event")
-	ErrReceiptBadSchema             = errors.New("bad_receipt_schema")
-	ErrReceiptBadSignature          = errors.New("bad_receipt_signature")
-	ErrReceiptUnanchored            = errors.New("unanchored_receipt")
-	ErrReceiptNotInRoster           = errors.New("receipt_not_in_roster")
-	ErrReceiptBadOutcome            = errors.New("bad_receipt_outcome")
-	ErrReceiptNoOutputs             = errors.New("receipt_has_no_outputs")
-	ErrReceiptBadOutput             = errors.New("bad_receipt_output")
-	ErrReceiptParamsVersionMismatch = errors.New("receipt_params_version_mismatch")
+	ErrVerdictKind                    = errors.New("not_a_verdict_event")
+	ErrVerdictBadSchema               = errors.New("bad_verdict_schema")
+	ErrVerdictUnanchored              = errors.New("unanchored_verdict")
+	ErrVerdictBadSignature            = errors.New("bad_verdict_signature")
+	ErrVerdictNotInRoster             = errors.New("verdict_not_in_roster")
+	ErrCommitmentKind                 = errors.New("not_a_state_commitment")
+	ErrCommitmentBadSchema            = errors.New("bad_state_commitment_schema")
+	ErrCommitmentBadSignature         = errors.New("bad_state_commitment_signature")
+	ErrCommitmentUnanchored           = errors.New("unanchored_state_commitment")
+	ErrPulseKind                      = errors.New("not_a_state_pulse")
+	ErrPulseBadSchema                 = errors.New("bad_state_pulse_schema")
+	ErrPulseBadSignature              = errors.New("bad_state_pulse_signature")
+	ErrPulseUnanchored                = errors.New("unanchored_state_pulse")
+	ErrPulseNotInRoster               = errors.New("state_pulse_not_in_roster")
+	ErrParamsKind                     = errors.New("not_a_params_event")
+	ErrParamsBadSchema                = errors.New("bad_params_schema")
+	ErrParamsBadSignature             = errors.New("bad_params_signature")
+	ErrParamsUnanchored               = errors.New("unanchored_params_event")
+	ErrParamsNotInRoster              = errors.New("params_not_in_roster")
+	ErrReceiptKind                    = errors.New("not_a_receipt_event")
+	ErrReceiptBadSchema               = errors.New("bad_receipt_schema")
+	ErrReceiptBadSignature            = errors.New("bad_receipt_signature")
+	ErrReceiptUnanchored              = errors.New("unanchored_receipt")
+	ErrReceiptNotInRoster             = errors.New("receipt_not_in_roster")
+	ErrReceiptBadOutcome              = errors.New("bad_receipt_outcome")
+	ErrReceiptNoOutputs               = errors.New("receipt_has_no_outputs")
+	ErrReceiptBadOutput               = errors.New("bad_receipt_output")
+	ErrReceiptParamsVersionMismatch   = errors.New("receipt_params_version_mismatch")
+	ErrCommitteeSignatureKind         = errors.New("not_a_committee_signature")
+	ErrCommitteeSignatureBadSchema    = errors.New("bad_committee_signature_schema")
+	ErrCommitteeSignatureBadSignature = errors.New("bad_committee_signature_signature")
+	ErrCommitteeSignatureUnanchored   = errors.New("unanchored_committee_signature")
+	ErrCommitteeSignatureNotInRoster  = errors.New("committee_signature_not_in_roster")
+	ErrCommitteeSignatureBadDigest    = errors.New("committee_signature_digest_mismatch")
+	ErrCommitteeSignatureBadAggregate = errors.New("committee_signature_bad_aggregate")
+	ErrSettlementCarrierBadSchema     = errors.New("bad_settlement_carrier_schema")
+	ErrSettlementCarrierBadPayload    = errors.New("bad_settlement_carrier_payload")
 )
 
 // ValidatorKey is one roster entry: a validator's Nostr pubkey, its moniker and
@@ -527,6 +544,147 @@ func ParseStateCommitment(ev *Event, roster map[string]ValidatorKey) (*StateComm
 	}
 	if !factSignerAllowed(ev, roster) {
 		return nil, fmt.Errorf("%w: %s", ErrVerdictNotInRoster, ev.Pubkey)
+	}
+	return &c, nil
+}
+
+// CommitteeSignatureInput is one committed escrow input in the SIG_ALL order.
+type CommitteeSignatureInput struct {
+	Secret string `json:"secret"`
+	C      string `json:"C"`
+}
+
+// CommitteeSignatureOutput is one committed template output in template order.
+type CommitteeSignatureOutput struct {
+	Amount int64  `json:"amount"`
+	B      string `json:"B_"`
+}
+
+// CommitteeSignatureContent is the exact content JSON of a kind-1451 committee
+// signature.  It carries the aggregate AND the ordered SIG_ALL inputs an
+// executor needs, so a wallet or facilitator can reconstruct the digest without
+// guessing the committed ordering.
+type CommitteeSignatureContent struct {
+	Schema    string                     `json:"schema"`
+	Bid       string                     `json:"bid"`
+	Auction   string                     `json:"auction"`
+	Outcome   string                     `json:"outcome"`
+	Height    int64                      `json:"height"`
+	BlockHash string                     `json:"block_hash"`
+	AppHash   string                     `json:"app_hash"`
+	Digest    string                     `json:"digest"`
+	Signature string                     `json:"signature"`
+	Inputs    []CommitteeSignatureInput  `json:"inputs"`
+	Outputs   []CommitteeSignatureOutput `json:"outputs"`
+}
+
+// committeeSignatureDigest is the frozen digest: sha256 over each input's
+// secret||C followed by each output's decimal amount||B_, exactly the NUT-11
+// SIG_ALL message the chain already signs.  It is the same bytes as
+// sigAllMessage/arenaSigAllDigest, so a 1451 digest and a settle tx's Sig cover
+// the same message.
+func committeeSignatureDigest(inputs []CommitteeSignatureInput, outputs []CommitteeSignatureOutput) string {
+	var sb strings.Builder
+	for _, in := range inputs {
+		sb.WriteString(in.Secret)
+		sb.WriteString(in.C)
+	}
+	for _, out := range outputs {
+		sb.WriteString(strconv.FormatInt(out.Amount, 10))
+		sb.WriteString(out.B)
+	}
+	d := sha256.Sum256([]byte(sb.String()))
+	return hex.EncodeToString(d[:])
+}
+
+// BuildCommitteeSignatureEvent builds a signed kind-1451 committee signature.
+// The anchor (height + block hash) and the aggregate are mandatory: an
+// unanchored signature cannot be built at all.  The event is signed under sk --
+// the elected coordinator's own verdict key.
+func BuildCommitteeSignatureEvent(sk *btcec.PrivateKey, c CommitteeSignatureContent, at int64) (*Event, error) {
+	if c.Height <= 0 || c.BlockHash == "" {
+		return nil, ErrCommitteeSignatureUnanchored
+	}
+	if !lowerHex(c.Bid, 64) || !lowerHex(c.BlockHash, 64) || !lowerHex(c.AppHash, 64) ||
+		!lowerHex(c.Digest, 64) || !lowerHex(c.Signature, 128) {
+		return nil, fmt.Errorf("%w: ids, hashes, digest and signature must be lowercase hex", ErrCommitteeSignatureBadSchema)
+	}
+	if c.Outcome != "settle" && c.Outcome != "refund" {
+		return nil, fmt.Errorf("%w: outcome %q", ErrCommitteeSignatureBadSchema, c.Outcome)
+	}
+	if len(c.Inputs) == 0 || len(c.Outputs) == 0 || len(c.Outputs) > 64 {
+		return nil, fmt.Errorf("%w: inputs/outputs count", ErrCommitteeSignatureBadSchema)
+	}
+	if got := committeeSignatureDigest(c.Inputs, c.Outputs); got != c.Digest {
+		return nil, fmt.Errorf("%w: digest %s does not cover the inputs and outputs", ErrCommitteeSignatureBadDigest, c.Digest)
+	}
+	c.Schema = CommitteeSignatureSchema
+	body, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	tags := [][]string{
+		{"bid", c.Bid},
+		{"auction", c.Auction},
+		{"outcome", c.Outcome},
+		{"height", strconv.FormatInt(c.Height, 10)},
+		{"hash", c.BlockHash},
+		{"p", NostrPubkeyHex(sk)},
+	}
+	return SignEvent(sk, KindCommitteeSignature, string(body), tags, at)
+}
+
+// ParseCommitteeSignature reads a kind-1451 event as an executor would: it
+// verifies the event signature, the schema, the mandatory anchor, the roster
+// membership, the digest over the ordered inputs/outputs, and the FROST
+// aggregate under groupKey.  The anchor is read from the TAGS and cross-checked
+// against the content, so a relay that re-framed one cannot hide the other.
+func ParseCommitteeSignature(ev *Event, roster map[string]ValidatorKey, groupKey string) (*CommitteeSignatureContent, error) {
+	if ev == nil || ev.Kind != KindCommitteeSignature {
+		return nil, ErrCommitteeSignatureKind
+	}
+	if err := ev.Verify(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCommitteeSignatureBadSignature, err)
+	}
+	var c CommitteeSignatureContent
+	if err := json.Unmarshal([]byte(ev.Content), &c); err != nil {
+		return nil, ErrCommitteeSignatureBadSchema
+	}
+	if c.Schema != CommitteeSignatureSchema {
+		return nil, fmt.Errorf("%w: %q", ErrCommitteeSignatureBadSchema, c.Schema)
+	}
+	tagBid, okBid := tagValue(ev.Tags, "bid")
+	tagAuction, okAuction := tagValue(ev.Tags, "auction")
+	tagOutcome, okOutcome := tagValue(ev.Tags, "outcome")
+	tagHeight, okH := tagValue(ev.Tags, "height")
+	tagHash, okHash := tagValue(ev.Tags, "hash")
+	if !okBid || !okAuction || !okOutcome || !okH || !okHash ||
+		tagBid != c.Bid || tagAuction != c.Auction || tagOutcome != c.Outcome ||
+		tagHeight != strconv.FormatInt(c.Height, 10) || tagHash != c.BlockHash {
+		return nil, ErrCommitteeSignatureUnanchored
+	}
+	if c.Height <= 0 || c.BlockHash == "" || c.AppHash == "" || c.Bid == "" || c.Auction == "" {
+		return nil, ErrCommitteeSignatureUnanchored
+	}
+	if c.Outcome != "settle" && c.Outcome != "refund" {
+		return nil, fmt.Errorf("%w: outcome %q", ErrCommitteeSignatureBadSchema, c.Outcome)
+	}
+	if !lowerHex(c.Bid, 64) || !lowerHex(c.BlockHash, 64) || !lowerHex(c.AppHash, 64) ||
+		!lowerHex(c.Digest, 64) || !lowerHex(c.Signature, 128) {
+		return nil, fmt.Errorf("%w: ids, hashes, digest and signature must be lowercase hex", ErrCommitteeSignatureBadSchema)
+	}
+	if len(c.Inputs) == 0 || len(c.Outputs) == 0 || len(c.Outputs) > 64 {
+		return nil, fmt.Errorf("%w: inputs/outputs count", ErrCommitteeSignatureBadSchema)
+	}
+	if got := committeeSignatureDigest(c.Inputs, c.Outputs); got != c.Digest {
+		return nil, fmt.Errorf("%w: digest %s does not cover the inputs and outputs", ErrCommitteeSignatureBadDigest, c.Digest)
+	}
+	dh, err := hex.DecodeString(c.Digest)
+	if err != nil || len(dh) != 32 || !schnorrVerifyHash(dh, groupKey, c.Signature) {
+		return nil, ErrCommitteeSignatureBadAggregate
+	}
+	if !factSignerAllowed(ev, roster) {
+		return nil, fmt.Errorf("%w: %s", ErrCommitteeSignatureNotInRoster, ev.Pubkey)
 	}
 	return &c, nil
 }

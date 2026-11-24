@@ -1,11 +1,11 @@
 # Nostr kinds used by the auctions arena
 
-Every kind is defined once in `chain/nostr.go` (`AuctionKinds`, kinds 1440–1450
+Every kind is defined once in `chain/nostr.go` (`AuctionKinds`, kinds 1440–1452
 plus the ephemeral pulse 21447); this table is derived from that map and from
 the builders/parsers in `chain/verdict.go`, `chain/lotevents.go` and
 `chain/verdictpublish.go`. Nothing here is guessed.
 
-The 1440–1450 series are all **regular** kinds (NIP-01 `1000 ≤ n < 10000`): khatru
+The 1440–1452 series are all **regular** kinds (NIP-01 `1000 ≤ n < 10000`): khatru
 (the relay this deployment runs) refuses an ephemeral event with no live
 subscription and does not buffer it, so a fact a client must be able to read
 later cannot live in the ephemeral range. The one deliberate exception is the
@@ -29,6 +29,8 @@ the `p` tag carries the signer pubkey and readers check it against the roster.
 | **1448** | params | each **validator**, under its own key | `height` + `app_hash` of the same pass as the commitment | clients reading the live escrow terms (mint, keyset, roster, `settlementSafetySec`, `bidToConsensusLatencySec`, window bounds) |
 | **1449** | lot / bid-admit / create-admit | each **validator**, under its own key | mandatory `height` + `block_hash`; three schemas told apart by the content `schema` string: `arena.lot.v1` (a lot's committed end), `arena.bidadmit.v1` (the chain accepted a bid), `arena.createadmit.v1` (the chain accepted a lot) | relay-only clients: lot end, bid confirmation, and which auctions are followed |
 | **1450** | refusal | each **validator**, under its own key | mandatory `height` + `block_hash` of the rejecting block | a client whose 1440/1441 the chain dropped (reason published **verbatim**) |
+| **1451** | committee signature | the **elected coordinator validator**, under its own verdict key | mandatory `height` + `hash` of a **committed** block, cross-checked against the content; the digest is the committed SIG_ALL message | executors: the facilitator and the recipient's wallet |
+| **1452** | settlement carrier | **any** key (the courier: facilitator, recipient wallet, observer) | **none**; the chain's acceptance is the `settle:` transaction it commits | the chain (ingest) and the app (a claim candidate) |
 | **21447** | state pulse (**ephemeral**) | each **validator**, under its own key | `height` + `app_hash`; **ephemeral**, relayed to live subscribers only and never stored | live subscribers placing the chain's clock between commitments |
 
 Notes:

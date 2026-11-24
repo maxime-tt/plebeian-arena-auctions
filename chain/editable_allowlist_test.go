@@ -53,6 +53,7 @@ func TestKindMapIsRegularRange(t *testing.T) {
 		"settle": KindSettle, "outcome": KindOutcome, "funding_abort": KindFundingAbort,
 		"state_commit": KindStateCommit, "params": KindParams,
 		"lot": KindLot, "refused": KindRefused,
+		"committee_signature": KindCommitteeSignature, "settlement_carrier": KindSettlementCarrier,
 	}
 	for role, k := range want {
 		if AuctionKinds[role] != k {
@@ -83,7 +84,7 @@ func TestKindMapIsRegularRange(t *testing.T) {
 		}
 	}
 	// the series must line up with the spec's exact numbering
-	for role, k := range map[string]int{"create": 1440, "bid": 1441, "chat": 1442, "refund": 1443, "settle": 1444, "outcome": 1445, "funding_abort": 1446, "state_commit": 1447, "params": 1448, "lot": 1449, "refused": 1450} {
+	for role, k := range map[string]int{"create": 1440, "bid": 1441, "chat": 1442, "refund": 1443, "settle": 1444, "outcome": 1445, "funding_abort": 1446, "state_commit": 1447, "params": 1448, "lot": 1449, "refused": 1450, "committee_signature": 1451, "settlement_carrier": 1452} {
 		if AuctionKinds[role] != k {
 			t.Errorf("role %q must be %d, got %d", role, k, AuctionKinds[role])
 		}

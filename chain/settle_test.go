@@ -9,7 +9,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -52,19 +52,27 @@ func (m *testMint) blindSign(t *testing.T, o SignOutput) blindSig {
 	return bs
 }
 
-func testSettler(t *testing.T, a *App) *settler {
-	return &settler{p: a.st.Params, journal: filepath.Join(t.TempDir(), "j.jsonl"), done: map[string]*settleAttempt{}, tries: map[string][]*settleAttempt{}}
+// blindSig is the mint's side of one swap output: C_ = k*B_ with a NUT-12 DLEQ.
+// It is a test type: production has no mint client any more (chain/settler.go
+// was deleted; the chain never touches the mint).
+type blindSig struct {
+	ID     string `json:"id"`
+	Amount int64  `json:"amount"`
+	C_     string `json:"C_"`
+	DLEQ   *struct {
+		E string `json:"e"`
+		S string `json:"s"`
+	} `json:"dleq"`
 }
 
-// mintMove submits one committed outcome the way the settler does: it derives
-// the template's outputs from committed state, "swaps" them at the fake mint,
-// unblinds, and builds the settle tx with the committee group signature over
-// exactly the committed outputs.
+// mintMove submits one committed outcome the way an executor does: it derives
+// the template's outputs from committed state via the strict parser, "swaps"
+// them at the fake mint, unblinds, and builds the settle tx with the committee
+// group signature over exactly the committed outputs.
 func mintMove(t *testing.T, a *App, m *testMint, bidID, outcome, to string, now int64) *settleTx {
 	t.Helper()
-	st := testSettler(t, a)
 	bid := a.st.Bids[bidID]
-	outs, reveal, _, err := st.templateMaterial(bid, outcome)
+	template, outs, err := a.st.settlementOutputs(bid, outcome)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,11 +80,31 @@ func mintMove(t *testing.T, a *App, m *testMint, bidID, outcome, to string, now 
 	for i, o := range outs {
 		sigs[i] = m.blindSign(t, o)
 	}
-	at := &settleAttempt{Bid: bidID, Outcome: outcome, To: to, Outputs: outs, Reveal: reveal}
-	if err := st.finish(at, sigs); err != nil {
-		t.Fatal(err)
+	proofs := make([]Proof, len(sigs))
+	for i, bs := range sigs {
+		o := outs[i]
+		A, err := parsePub(a.st.Params.Keys[strconv.FormatInt(o.Amount, 10)])
+		if err != nil {
+			t.Fatal(err)
+		}
+		Cb, err := parsePub(bs.C_)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := parseScalar(template.Outputs[i].R)
+		if err != nil {
+			t.Fatal(err)
+		}
+		C := add(Cb, neg(mul(r, A)))
+		pr := Proof{ID: o.ID, Amount: o.Amount, Secret: template.Outputs[i].Secret,
+			C: hex.EncodeToString(C.SerializeCompressed()),
+			DLEQ: &DLEQ{E: bs.DLEQ.E, S: bs.DLEQ.S, R: template.Outputs[i].R}}
+		if err := verifyDLEQ(pr, A); err != nil {
+			t.Fatalf("mint DLEQ: %v", err)
+		}
+		proofs[i] = pr
 	}
-	return &settleTx{Bid: bidID, Outcome: outcome, Proofs: at.Proofs, Sig: groupSign(t, sigAllMessage(bid.Proofs, outs))}
+	return &settleTx{Bid: bidID, Outcome: outcome, Proofs: proofs, Sig: groupSign(t, sigAllMessage(bid.Proofs, outs))}
 }
 
 func outputsOf(proofs []Proof) []SignOutput {

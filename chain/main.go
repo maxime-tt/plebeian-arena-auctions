@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -174,23 +173,23 @@ func cmdGateway(args []string) {
 	fs.Var(&relays, "relay", "relay websocket URL clients publish to (repeatable); the relay is the primary transport")
 	fs.Parse(args)
 
-	// Bind nothing public (handover §6.2).  The gateway's listener carries only
-	// the mesh-internal coordinator endpoint, so it must name one interface; dev
-	// mode, which serves the public UI, additionally requires loopback.
-	if err := validateBindAddr(*addr); err != nil {
-		log.Fatalf("gateway: %v", err)
-	}
-	if *dev && !isLoopbackAddr(*addr) {
-		log.Fatalf("gateway: -dev requires a loopback -addr (got %s): dev mode serves the public UI and is never a deployed role", *addr)
-	}
-	if *dev && !isLoopbackHost(*meshHost) {
-		// Dev is a single-host run: the validators' mesh listeners and their
-		// CometBFT RPC listeners (which nodeConfig binds to 127.0.0.1) must be
-		// reachable from the same host, so a non-loopback -mesh-host would make
-		// the dev UI talk to nothing.
-		log.Fatalf("gateway: -dev requires a loopback -mesh-host (got %s): dev mode is a single-host run", *meshHost)
-	}
+	// A deployed gateway is the validator supervisor only: it starts no HTTP
+	// listener and registers no route.  Dev mode keeps the public UI/probe
+	// surface and therefore needs a loopback bind and mesh host.
 	if *dev {
+		if err := validateBindAddr(*addr); err != nil {
+			log.Fatalf("gateway: %v", err)
+		}
+		if !isLoopbackAddr(*addr) {
+			log.Fatalf("gateway: -dev requires a loopback -addr (got %s): dev mode serves the public UI and is never a deployed role", *addr)
+		}
+		if !isLoopbackHost(*meshHost) {
+			// Dev is a single-host run: the validators' mesh listeners and their
+			// CometBFT RPC listeners (which nodeConfig binds to 127.0.0.1) must be
+			// reachable from the same host, so a non-loopback -mesh-host would make
+			// the dev UI talk to nothing.
+			log.Fatalf("gateway: -dev requires a loopback -mesh-host (got %s): dev mode is a single-host run", *meshHost)
+		}
 		log.Printf("gateway: DEV MODE on %s: serving the public /api/* and /mint/ routes and the static UI; this is NOT a deployed role", *addr)
 	}
 
@@ -199,12 +198,22 @@ func cmdGateway(args []string) {
 	for i := range 4 {
 		check(sup.start(i))
 	}
+
+	// A deployed role: supervise the validators and stop them on SIGTERM/SIGINT.
+	// There is no HTTP server and no route to register.
+	if !*dev {
+		log.Printf("gateway: deployed role: supervising validators only (no HTTP listener)")
+		stop := make(chan os.Signal, 1)
+		signalNotify(stop)
+		<-stop
+		stopSupervisor(sup)
+		return
+	}
+
 	publisher := newRelayPublisher(relays)
 
 	// push: "a block was committed" as Server-Sent Events (events.go)
 	// the validator long-polls (/height?after=N waits up to 20 s for a block).
-	// The hub is kept even in a deployed role, where it is no longer a public
-	// route: the settler watches it for new heights.
 	evCl := &http.Client{Timeout: 25 * time.Second}
 	hub := newEventHub(func(after int64) (int64, bool) {
 		for i := range 4 {
@@ -217,51 +226,32 @@ func cmdGateway(args []string) {
 		return 0, false
 	})
 
-	// relay a release request to every validator's signer; the browser assembles 3 of 4
-	// escrow release: one FROST signing round across the validators
-	rc, err := loadCoordinator(*root, func(i int, path string, body any, out any) (int, error) {
-		b, _ := json.Marshal(body)
-		resp, err := client.Post(validatorURL(*meshHost, i)+path, "application/json", bytes.NewReader(b))
-		if err != nil {
-			return 0, err
-		}
-		defer resp.Body.Close()
-		json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
-		return resp.StatusCode, nil
-	})
-	check(err)
-	// push settlement (ADR 0009, spec §5): refunds and settles the moment they
-	// are due, over the bid's committed outcome templates. The settler is an
-	// executor: it names the bid and the outcome and submits the bidder's own
-	// pre-signed template.
-	if os.Getenv("ARENA_PUSH") != "0" {
-		go newSettler(rc, *mint, sup.running, hub, filepath.Join(filepath.Dir(*root), "settle-journal.jsonl")).run()
-	}
-
 	// The route table is a pure function of these dependencies (see gateway.go).
-	// A deployed role registers the mesh-internal coordinator endpoint and
-	// nothing else; dev keeps the retired public surface for the dev UI.
-	deps := gatewayDeps{sup: sup, pub: publisher, hub: hub, rc: rc, chat: &chatLog{}, meshHost: *meshHost, static: *static, mint: *mint, demoControls: *demo}
-	handler := gatewayMux(deps, *dev)
+	// Dev keeps the retired public surface for the dev UI.
+	deps := gatewayDeps{sup: sup, pub: publisher, hub: hub, chat: &chatLog{}, meshHost: *meshHost, static: *static, mint: *mint, demoControls: *demo}
+	handler := gatewayMux(deps, true)
 
-	srv := &http.Server{Addr: *addr, Handler: handler,
-		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
-	log.Printf("gateway on %s (dev=%v)", *addr, *dev)
+	srv := gatewayServer(true, *addr, handler)
+	log.Printf("gateway on %s (dev=true)", *addr)
 	go func() {
 		sigc := make(chan os.Signal, 1)
 		signalNotify(sigc)
 		<-sigc
-		// stop all four at once: each may take a few seconds to write its
-		// shutdown snapshot, and systemd's TimeoutStopSec is 20 s
-		var wg sync.WaitGroup
-		for i := range 4 {
-			wg.Add(1)
-			go func(i int) { defer wg.Done(); sup.stop(i) }(i)
-		}
-		wg.Wait()
+		stopSupervisor(sup)
 		os.Exit(0)
 	}()
 	log.Fatal(srv.ListenAndServe())
+}
+
+// stopSupervisor stops all four validators at once: each may take a few seconds
+// to write its shutdown snapshot, and systemd's TimeoutStopSec is 20 s.
+func stopSupervisor(sup *supervisor) {
+	var wg sync.WaitGroup
+	for i := range 4 {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); sup.stop(i) }(i)
+	}
+	wg.Wait()
 }
 
 // validatorRPC names one validator's CometBFT RPC endpoint for the /api/tx
@@ -383,6 +373,16 @@ type txPublisher interface {
 // relay publish on its own is never ok.  With no acceptor, a terminal rejection
 // is a 400 and anything else (all transports down, nodes catching up) is a 503.
 func submitTx(ctx context.Context, client *http.Client, validators []validatorRPC, event Event, tx []byte, publisher txPublisher) (int, map[string]any) {
+	// A settlement carrier is not a chain event: its content IS the settleTx
+	// payload.  Convert it here so the direct /api/tx path and the relay ingest
+	// both submit the same bytes decodeTx/parseSettle already accepts.
+	if event.Kind == KindSettlementCarrier {
+		st, err := parseSettlementCarrier(event.Content)
+		if err != nil {
+			return http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()}
+		}
+		tx = makeSettle(st)
+	}
 	hash := txHash(tx)
 
 	// The relay is transport and discovery: every validator's observer picks the

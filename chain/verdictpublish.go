@@ -842,6 +842,33 @@ func (p *Publisher) publishRefusals(ctx context.Context, state *State, height in
 	return any
 }
 
+// PublishCommitteeSignature publishes kind 1451 under this validator's verdict
+// key, anchored at the committed block hash for the content's height.  The
+// content's BlockHash is filled from the node's BlockStore; a height the store
+// does not know is refused (the event is never published unanchored).
+func (p *Publisher) PublishCommitteeSignature(ctx context.Context, c CommitteeSignatureContent) error {
+	if c.Height <= 0 {
+		return errPublisher("committee signature: a positive committed height is required")
+	}
+	blockHash, ok := p.blockHash(c.Height)
+	if !ok || blockHash == "" {
+		return errPublisher("committee signature: committed block hash unavailable")
+	}
+	c.BlockHash = blockHash
+	ev, err := BuildCommitteeSignatureEvent(p.key, c, p.now())
+	if err != nil {
+		return err
+	}
+	rec := PublishRecord{Op: "committee_signature", CommittedHeight: c.Height, Height: c.Height, Hash: blockHash, AuctionID: c.Auction, Outcome: c.Outcome}
+	if err := p.relay.Publish(ctx, ev); err != nil {
+		rec.Error = err.Error()
+		p.record(rec)
+		return err
+	}
+	p.record(rec)
+	return nil
+}
+
 func (p *Publisher) record(r PublishRecord) {
 	p.mu.Lock()
 	p.records = append(p.records, r)

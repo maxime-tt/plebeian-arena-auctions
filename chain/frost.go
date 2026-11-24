@@ -350,6 +350,13 @@ type releaseResult struct {
 // least three of them computed) sign. If a chosen signer fails in round 2,
 // a whole new round runs without it: nonces are never reused (each session
 // is deleted when taken), so a retry always means fresh commitments.
+// Release marshals a SignReq and runs one FROST signing round.  It is the
+// node-side entry point: the coordinator lives inside the elected validator.
+func (rc *releaseCoordinator) Release(req SignReq) (int, releaseResult) {
+	b, _ := json.Marshal(req)
+	return rc.release(b)
+}
+
 func (rc *releaseCoordinator) release(req json.RawMessage) (int, releaseResult) {
 	res := releaseResult{GroupKey: rc.groupKey, Cosigners: []string{}, Refusals: []map[string]string{}}
 	exclude := map[int]bool{}

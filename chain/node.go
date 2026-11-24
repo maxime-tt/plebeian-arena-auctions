@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -251,11 +252,16 @@ func cmdNode(args []string) {
 	fs.Var(&relays, "relay", "relay websocket URL: ingests auction events from it and publishes verdicts and state commitments to it (repeatable)")
 	commitMax := fs.Duration("commit-max-interval", StateCommitMaxInterval, "maximum wall-clock gap between state commitments")
 	meshHost := fs.String("mesh-host", "127.0.0.1", "address the mesh HTTP listener (the internal /state, /bid, /height, /due, /status and /frost endpoints) binds to; on a deployed node this is the node's FIPS address, on a single host it stays loopback")
+	meshPeers := fs.String("mesh-peers", defaultMeshPeers(), "comma-separated host:port of the four validators' mesh listeners in index order 1..4; default 127.0.0.1:<httpPort(j)>")
 	fs.Parse(args)
 	if *every < 0 || *retain < 0 {
 		log.Fatal("-snapshot-every and -retain-blocks must be >= 0")
 	}
 	i := *idx - 1
+	meshPeerList, err := parseMeshPeers(*meshPeers)
+	if err != nil {
+		log.Fatalf("node: %v", err)
+	}
 	// The mesh listener is NOT a public surface (handover §6.1/§6.2): it must
 	// name one interface.  The FIPS ACL is the peer firewall (handover §3.2),
 	// so there is no second auth scheme here -- binding 0.0.0.0/:: would expose
@@ -265,9 +271,9 @@ func cmdNode(args []string) {
 		log.Fatalf("node: %v", err)
 	}
 	home := homeOf(*root, i)
-	peers, err := os.ReadFile(filepath.Join(home, "peers.txt"))
+	peerList, err := os.ReadFile(filepath.Join(home, "peers.txt"))
 	check(err)
-	c := nodeConfig(home, i, string(peers))
+	c := nodeConfig(home, i, string(peerList))
 	pv := privval.LoadFilePV(c.PrivValidatorKeyFile(), c.PrivValidatorStateFile())
 	nk, err := p2p.LoadOrGenNodeKey(c.NodeKeyFile())
 	check(err)
@@ -321,8 +327,22 @@ func cmdNode(args []string) {
 	// committed, anchored to that committed block's hash, read here from the
 	// node's own block store.
 	var verdictPub *Publisher
+	var coordinator *releaseCoordinator
+	var verdictPubkey string
 	if len(relays) > 0 {
-		verdictPub = startVerdictPublish(app, n, home, i, relays, *commitMax)
+		vk, err := loadVerdictKey(filepath.Join(home, "config", "verdict_key.json"))
+		if err != nil {
+			log.Printf("%s: verdict publish off: %v", names[i], err)
+		} else {
+			verdictPubkey = NostrPubkeyHex(vk)
+			verdictPub = startVerdictPublish(app, n, vk, i, relays, *commitMax)
+			if verdictPub != nil {
+				coordinator, err = loadCoordinator(*root, coordinatorPost(&http.Client{Timeout: 4 * time.Second}, meshPeerList))
+				if err != nil {
+					log.Printf("%s: settlement coordinator off: %v", names[i], err)
+				}
+			}
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -411,6 +431,14 @@ func cmdNode(args []string) {
 	srv := &http.Server{Addr: meshAddr, Handler: mux,
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() { log.Println(srv.ListenAndServe()) }()
+
+	// The elected validator signs due outcomes autonomously.  It runs beside
+	// runCloser on the same stop channel; the publisher is nil when no relay is
+	// configured, and then there is nowhere to publish a 1451, so the pass is
+	// skipped entirely.  No mint call is made here.
+	if verdictPub != nil && coordinator != nil {
+		go runSettlementSigner(stopCloser, app, verdictPub, coordinator, coordinator.params.Validators, verdictPubkey)
+	}
 
 	// Relay ingest: subscribe to the configured relay(s) and submit every
 	// verified auction/bid event into the mempool of EVERY validator.  One
@@ -658,9 +686,164 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 	}
 }
 
+// defaultMeshPeers is the loopback mesh for the four validators in index order.
+func defaultMeshPeers() string {
+	parts := make([]string, 4)
+	for j := range 4 {
+		parts[j] = fmt.Sprintf("127.0.0.1:%d", httpPort(j))
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseMeshPeers parses -mesh-peers into four host:port entries.  A missing or
+// empty entry falls back to the loopback default for that index, so a single
+// host needs no flag at all and a deployed node can name only the peers it
+// differs on.
+func parseMeshPeers(raw string) ([]string, error) {
+	parts := strings.Split(strings.TrimSpace(raw), ",")
+	if len(parts) > 4 {
+		return nil, fmt.Errorf("-mesh-peers takes at most 4 host:port entries, got %d", len(parts))
+	}
+	defaults := strings.Split(defaultMeshPeers(), ",")
+	out := make([]string, 4)
+	for j := range 4 {
+		entry := ""
+		if j < len(parts) {
+			entry = strings.TrimSpace(parts[j])
+		}
+		if entry == "" {
+			entry = defaults[j]
+		}
+		if _, _, err := net.SplitHostPort(entry); err != nil {
+			return nil, fmt.Errorf("-mesh-peers[%d] %q is not host:port: %w", j+1, entry, err)
+		}
+		out[j] = entry
+	}
+	return out, nil
+}
+
+// coordinatorPost builds the releaseCoordinator's egress: the four validators'
+// mesh listeners, in index order.  It is the node's only outbound mesh call and
+// it reaches only the frozen /frost/commit and /frost/sign endpoints.
+func coordinatorPost(client *http.Client, peers []string) func(i int, path string, body any, out any) (int, error) {
+	return func(i int, path string, body any, out any) (int, error) {
+		if i < 0 || i >= len(peers) {
+			return 0, fmt.Errorf("mesh peer %d out of range", i+1)
+		}
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, err
+		}
+		resp, err := client.Post("http://"+peers[i]+path, "application/json", bytes.NewReader(b)) // #nosec G107 -- operator-configured mesh peer
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		if out != nil {
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
+				return resp.StatusCode, err
+			}
+		}
+		return resp.StatusCode, nil
+	}
+}
+
+// committeeSigner is the one method the signing pass needs from the FROST
+// coordinator.  Keeping it an interface lets the pass be tested without a live
+// four-validator mesh.
+type committeeSigner interface {
+	Release(req SignReq) (int, releaseResult)
+}
+
+// settlementElected reports whether this validator is the elected coordinator:
+// the smallest Params.Validators pubkey, compared as lowercase x-only hex.
+func settlementElected(validators []ValidatorKey, myPubkey string) bool {
+	if len(validators) == 0 {
+		return false
+	}
+	smallest := strings.ToLower(validators[0].Pubkey)
+	for _, v := range validators[1:] {
+		if p := strings.ToLower(v.Pubkey); p < smallest {
+			smallest = p
+		}
+	}
+	return strings.ToLower(myPubkey) == smallest
+}
+
+// runSettlementSigner is the 1 s signing pass beside runCloser.  It reads the
+// committed snapshot, takes the due outcomes, and -- only when this node is the
+// elected coordinator -- collects one FROST signature and publishes kind 1451.
+// The in-memory signed set makes a repeated tick idempotent; a restart publishes
+// a fresh valid aggregate (fresh nonces), which readers dedupe by digest.
+func runSettlementSigner(stop <-chan struct{}, app *App, pub *Publisher, signer committeeSigner, validators []ValidatorKey, myPubkey string) {
+	signed := map[string]bool{}
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		settlementTick(app, pub, signer, validators, myPubkey, signed)
+	}
+}
+
+// settlementTick performs one signing pass.  It makes NO mint call: the chain
+// only signs and publishes the committee signature.
+func settlementTick(app *App, pub *Publisher, signer committeeSigner, validators []ValidatorKey, myPubkey string, signed map[string]bool) {
+	if pub == nil || !settlementElected(validators, myPubkey) {
+		return
+	}
+	height, blockTime, appHash, raw := app.committedSnapshot()
+	if height <= 0 || len(raw) == 0 {
+		return
+	}
+	st := newState()
+	if json.Unmarshal(raw, st) != nil {
+		return
+	}
+	st.Height, st.Time = height, blockTime
+	for _, move := range st.dueMoves(time.Now().Unix()) {
+		key := move.Bid.ID + "|" + move.Outcome
+		if move.Bid.Settled != "" || signed[key] {
+			continue
+		}
+		code, res := signer.Release(SignReq{Bid: move.Bid.ID, Outcome: move.Outcome, Height: height})
+		if code != 200 || res.Signature == "" {
+			log.Printf("settlement signer: %s %s: %d %s", move.Bid.ID, move.Outcome, code, res.Error)
+			continue
+		}
+		_, outs, err := st.settlementOutputs(move.Bid, move.Outcome)
+		if err != nil {
+			log.Printf("settlement signer: %s %s: %v", move.Bid.ID, move.Outcome, err)
+			continue
+		}
+		inputs := make([]CommitteeSignatureInput, len(move.Bid.Proofs))
+		for i, proof := range move.Bid.Proofs {
+			inputs[i] = CommitteeSignatureInput{Secret: proof.Secret, C: proof.C}
+		}
+		outputs := make([]CommitteeSignatureOutput, len(outs))
+		for i, out := range outs {
+			outputs[i] = CommitteeSignatureOutput{Amount: out.Amount, B: out.B}
+		}
+		content := CommitteeSignatureContent{
+			Schema: CommitteeSignatureSchema, Bid: move.Bid.ID, Auction: move.Bid.Auction,
+			Outcome: move.Outcome, Height: height, AppHash: hex.EncodeToString(appHash),
+			Digest: committeeSignatureDigest(inputs, outputs), Signature: res.Signature,
+			Inputs: inputs, Outputs: outputs,
+		}
+		if err := pub.PublishCommitteeSignature(context.Background(), content); err != nil {
+			log.Printf("settlement signer: publish %s %s: %v", move.Bid.ID, move.Outcome, err)
+			continue
+		}
+		signed[key] = true
+	}
+}
+
 // startVerdictPublish wires the publish path onto a live validator (spec §9).
-// It reads the validator's own verdict key from its home, dials the relays, and
-// runs the publisher.  The block-hash source is the node's block store: the
+// It takes the validator's own verdict key (read from its home), dials the
+// relays, and runs the publisher.  The block-hash source is the node's block store: the
 // anchor on every verdict is the CometBFT block hash of a COMMITTED block, which
 // the ABCI app itself cannot see.  A misconfiguration is logged and disables
 // publishing -- it never takes the validator down, because publishing is a
@@ -669,12 +852,7 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 // It returns the publisher (nil when publishing is off) so the validator's
 // /status can serve its transport health: a relay that went away must be
 // visible from outside, not inferred from events that stopped appearing.
-func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []string, commitMax time.Duration) *Publisher {
-	vk, err := loadVerdictKey(filepath.Join(home, "config", "verdict_key.json"))
-	if err != nil {
-		log.Printf("%s: verdict publish off: %v", names[i], err)
-		return nil
-	}
+func startVerdictPublish(app *App, n *node.Node, vk *btcec.PrivateKey, i int, relays []string, commitMax time.Duration) *Publisher {
 	ctx, cancel := context.WithCancel(context.Background())
 	writer, closeRelays, err := DialRelays(ctx, relays)
 	if err != nil {

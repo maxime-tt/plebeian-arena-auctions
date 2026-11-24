@@ -41,17 +41,19 @@ type Event struct {
 // tree. TestKindMapIsRegularRange pins the whole series to the regular range
 // and names the pulse as its explicit, documented exception.
 const (
-	KindCreate       = 1440 // create / root: the auction listing and its supersessions
-	KindBid          = 1441 // bid
-	KindChat         = 1442 // chat (his; we publish nothing on it)
-	KindRefund       = 1443 // refund
-	KindSettle       = 1444 // settle
-	KindOutcome      = 1445 // outcome / validator verdict
-	KindFundingAbort = 1446 // funding abort
-	KindStateCommit  = 1447 // state commitment: the STORED anchor that proves a chain of time
-	KindParams       = 1448 // state params: the escrow terms committed in the app hash the event names
-	KindLot          = 1449 // lot state: the committed end of a lot, the bid that moved it, and a bid's admission
-	KindRefused      = 1450 // refusal: the chain's own reason for dropping a client event
+	KindCreate             = 1440 // create / root: the auction listing and its supersessions
+	KindBid                = 1441 // bid
+	KindChat               = 1442 // chat (his; we publish nothing on it)
+	KindRefund             = 1443 // refund
+	KindSettle             = 1444 // settle
+	KindOutcome            = 1445 // outcome / validator verdict
+	KindFundingAbort       = 1446 // funding abort
+	KindStateCommit        = 1447 // state commitment: the STORED anchor that proves a chain of time
+	KindParams             = 1448 // state params: the escrow terms committed in the app hash the event names
+	KindLot                = 1449 // lot state: the committed end of a lot, the bid that moved it, and a bid's admission
+	KindRefused            = 1450 // refusal: the chain's own reason for dropping a client event
+	KindCommitteeSignature = 1451 // committee signature: the elected coordinator's FROST aggregate over a committed outcome
+	KindSettlementCarrier  = 1452 // settlement carrier: a carried settle tx (any courier)
 	// KindStatePulse is the ephemeral heartbeat twin of the 1447 commitment: a
 	// (height, app_hash, time) tick published on every publish pass so a live
 	// subscriber can place the chain's clock. NIP-01 EPHEMERAL (20000-29999):
@@ -63,18 +65,20 @@ const (
 // AuctionKinds is the exported map of the whole series, so a reader (or a
 // test) can see and iterate every kind in one place.
 var AuctionKinds = map[string]int{
-	"create":        KindCreate,
-	"bid":           KindBid,
-	"chat":          KindChat,
-	"refund":        KindRefund,
-	"settle":        KindSettle,
-	"outcome":       KindOutcome,
-	"funding_abort": KindFundingAbort,
-	"state_commit":  KindStateCommit,
-	"params":        KindParams,
-	"lot":           KindLot,
-	"refused":       KindRefused,
-	"state_pulse":   KindStatePulse,
+	"create":              KindCreate,
+	"bid":                 KindBid,
+	"chat":                KindChat,
+	"refund":              KindRefund,
+	"settle":              KindSettle,
+	"outcome":             KindOutcome,
+	"funding_abort":       KindFundingAbort,
+	"state_commit":        KindStateCommit,
+	"params":              KindParams,
+	"lot":                 KindLot,
+	"refused":             KindRefused,
+	"committee_signature": KindCommitteeSignature,
+	"settlement_carrier":  KindSettlementCarrier,
+	"state_pulse":         KindStatePulse,
 }
 
 // regularKind: NIP-01's regular range, where relays are expected to STORE the

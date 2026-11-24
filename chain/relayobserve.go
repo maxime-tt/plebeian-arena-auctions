@@ -38,8 +38,11 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 )
 
-// RelayKinds are the only kinds the ingest transports: auction create and bid.
-var RelayKinds = []int{KindCreate, KindBid}
+// RelayKinds are the kinds the ingest transports: auction create and bid, plus
+// the settlement carrier (1452).  The carrier is a courier-agnostic settle tx
+// whose authority is its committee signature; an invalid one is refused at
+// admission, so reopening the ingest to it is not a public write path.
+var RelayKinds = []int{KindCreate, KindBid, KindSettlementCarrier}
 
 // IsRelayKind reports whether kind is one this ingest transports.
 func IsRelayKind(kind int) bool {

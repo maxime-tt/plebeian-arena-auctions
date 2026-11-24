@@ -135,6 +135,16 @@ func EventTransaction(event Event) ([]byte, error) {
 	if err := json.Compact(&compact, raw); err != nil {
 		return nil, err
 	}
+	// A settlement carrier is not a chain event: its content IS the settleTx
+	// payload.  Validate it here and return the settle: bytes the app's
+	// parseSettle branch already accepts, so decodeTx is never involved.
+	if event.Kind == KindSettlementCarrier {
+		st, err := parseSettlementCarrier(event.Content)
+		if err != nil {
+			return nil, err
+		}
+		return makeSettle(st), nil
+	}
 	// Prove the shape now rather than at submit time: a round-trip through the
 	// app's own decoder catches a malformed event here, not three hops later.
 	if _, err := decodeTx(compact.Bytes()); err != nil {

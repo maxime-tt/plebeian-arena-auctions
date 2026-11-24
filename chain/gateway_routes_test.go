@@ -5,8 +5,8 @@ package main
 // (handover §6.1/§6.2) is assertable without starting a process.
 //
 // The rules under test:
-//   - a DEPLOYED gateway (dev=false) registers ONLY POST /internal/settle; every
-//     retired public path is 404 and no static file is served;
+//   - a DEPLOYED gateway (dev=false) registers NO route and starts NO listener;
+//     every retired public path is absent because there is no handler at all;
 //   - dev mode still registers the public routes the repository's dev UI,
 //     acceptance script and probes use;
 //   - a bind address must name one interface: 0.0.0.0/:: are refused, loopback
@@ -27,7 +27,6 @@ func gatewayTestDeps() gatewayDeps {
 	return gatewayDeps{
 		sup:      &supervisor{},
 		hub:      hub,
-		rc:       &releaseCoordinator{},
 		chat:     &chatLog{},
 		meshHost: "127.0.0.1",
 		static:   "web/dist",
@@ -41,39 +40,15 @@ func serve(h http.Handler, method, path string) *httptest.ResponseRecorder {
 	return rec
 }
 
-// TestDeployedGatewayServesOnlyInternalSettle: no retired public route answers,
-// and nothing static is served.
-func TestDeployedGatewayServesOnlyInternalSettle(t *testing.T) {
-	h := gatewayMux(gatewayTestDeps(), false)
-
-	removed := []string{
-		"/api/state", "/api/bid", "/api/tx", "/api/settle", "/api/events",
-		"/api/chat", "/api/network", "/api/publish", "/mint/v1/info",
-		"/api/admin/validator/1/stop",
+// TestDeployedGatewayStartsNoListenerAndRegistersNoRoute: the deployed role is
+// the validator supervisor only.  gatewayMux returns nil, so cmdGateway builds
+// no http.Server and there is no route to serve.
+func TestDeployedGatewayStartsNoListenerAndRegistersNoRoute(t *testing.T) {
+	if h := gatewayMux(gatewayTestDeps(), false); h != nil {
+		t.Fatalf("a deployed gateway must register no route and start no listener, got %T", h)
 	}
-	for _, path := range removed {
-		for _, method := range []string{http.MethodGet, http.MethodPost} {
-			if rec := serve(h, method, path); rec.Code != http.StatusNotFound {
-				t.Errorf("%s %s = %d, want 404: a deployed gateway must not serve this route", method, path, rec.Code)
-			}
-		}
-	}
-
-	// No static file server either: the SPA fallback would have answered 200 (or
-	// a directory listing) on "/" and "/index.html".
-	for _, path := range []string{"/", "/index.html", "/assets/app.js"} {
-		if rec := serve(h, http.MethodGet, path); rec.Code != http.StatusNotFound {
-			t.Errorf("GET %s = %d, want 404: a deployed gateway serves no static UI", path, rec.Code)
-		}
-	}
-
-	// The coordinator's endpoint IS registered: a wrong method or a bad body is
-	// answered by the handler, never by the mux's 404.
-	if rec := serve(h, http.MethodGet, "/internal/settle"); rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("GET /internal/settle = %d, want 405 (registered)", rec.Code)
-	}
-	if rec := serve(h, http.MethodPost, "/internal/settle"); rec.Code != http.StatusBadRequest {
-		t.Errorf("POST /internal/settle with no body = %d, want 400 (registered)", rec.Code)
+	if srv := gatewayServer(false, "127.0.0.1:8080", nil); srv != nil {
+		t.Fatalf("a deployed gateway must not construct an http.Server, got %+v", srv)
 	}
 }
 
@@ -90,13 +65,6 @@ func TestDevGatewayKeepsThePublicRoutes(t *testing.T) {
 	deps.mint = mintSrv.URL
 	h := gatewayMux(deps, true)
 
-	// The two settlement entry points share one handler in dev.
-	if rec := serve(h, http.MethodGet, "/api/settle"); rec.Code == http.StatusNotFound {
-		t.Error("dev mode must register /api/settle")
-	}
-	if rec := serve(h, http.MethodGet, "/internal/settle"); rec.Code == http.StatusNotFound {
-		t.Error("dev mode must register /internal/settle")
-	}
 	// /api/state answers 503 with no validator running -- that is the handler,
 	// not the mux's 404.
 	if rec := serve(h, http.MethodGet, "/api/state"); rec.Code == http.StatusNotFound {

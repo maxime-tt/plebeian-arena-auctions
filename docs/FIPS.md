@@ -25,11 +25,13 @@ coordinator-facing read routes (`/state`, `/bid`, `/height`, `/due`, `/status`).
 The FIPS ACL is the only boundary on that listener: no route is public. The
 `arena-frost.nft` drop-in below opens the listener's port to the other three
 validators, which admits the read routes on that port to those peers as well;
-they never leave the mesh. The gateway/coordinator on the same host should use
-`-mesh-host 127.0.0.1`, so it reaches the listener over loopback without a mesh
-ACL entry. Who may trigger a signing round, and where the coordinator lives, is
-the open settlement-design item (handover §8.6); this increment does not give
-the coordinator a public route and does not move it.
+they never leave the mesh. The settlement coordinator now lives INSIDE the
+elected validator node (the smallest `Params.Validators` pubkey): each node
+reaches the others' `/frost/commit` and `/frost/sign` on this same listener, and
+a deployed node names its peers with `-mesh-peers` (default
+`127.0.0.1:<httpPort(j)>`). The deployed gateway is only the validator
+supervisor and starts no HTTP listener at all; ops visibility stays on the
+validators' mesh `/status`. (Handover §8.6 / Q2.)
 
 ## Per-node configuration shape (handover §3.2)
 

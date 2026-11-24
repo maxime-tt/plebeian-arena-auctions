@@ -3,17 +3,15 @@ package main
 // The gateway's HTTP surface, as a pure function of its dependencies so it can
 // be built and asserted on in a test (gateway_routes_test.go).
 //
-// Handover §6.1/§6.2: all public communication goes through Nostr relays, so a
-// DEPLOYED gateway serves exactly ONE route -- POST /internal/settle, the
-// coordinator's settlement push -- bound to the mesh listener.  The public
-// Nostr-era surface (/api/state, /api/bid, /api/tx, /api/settle, /api/events,
-// /api/chat, /api/network, /api/publish, /mint/ and /api/admin/) is removed, and
-// no static file is served.  Clients submit events to relays and read facts from
-// relays (kinds 1440-1450).
-//
-// The FIPS ACL is the peer firewall (handover §3.2): the mesh listener is
-// reachable only from the other whitelisted validators, so there is deliberately
-// no second auth scheme on these routes -- the transport is the boundary.
+// Handover §6.1/§6.2 and the settlement-facilitator contract §6: all public
+// communication goes through Nostr relays.  A DEPLOYED gateway is only the
+// validator supervisor: it starts/stops the four node processes and serves NO
+// HTTP listener and NO route.  The settlement coordinator lives INSIDE the
+// elected validator node, so the gateway needs no settlement push endpoint and
+// no coordinator dependency.  The public Nostr-era surface (/api/state,
+// /api/bid, /api/tx, /api/events, /api/chat, /api/network, /api/publish, /mint/
+// and /api/admin/) is removed, and no static file is served.  Clients submit
+// events to relays and read facts from relays (kinds 1440-1452).
 //
 // dev=true keeps the old public routes and the static UI for the repository's
 // own dev UI, the acceptance script and the probes.  It is never a deployed
@@ -47,7 +45,6 @@ type gatewayDeps struct {
 	sup      *supervisor
 	pub      *relayPublisher
 	hub      *eventHub
-	rc       *releaseCoordinator
 	chat     *chatLog
 	meshHost string
 	static   string
@@ -62,35 +59,14 @@ type gatewayDeps struct {
 func gatewayMux(d gatewayDeps, dev bool) http.Handler {
 	mu := http.NewServeMux()
 
-	// The coordinator's settlement push.  This is the existing rc.release body,
-	// mesh-only, and it is the ONLY route a deployed gateway registers.
-	settle := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, 405, map[string]string{"error": "POST only"})
-			return
-		}
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		if !json.Valid(body) {
-			writeJSON(w, 400, map[string]string{"error": "bad request"})
-			return
-		}
-		code, res := d.rc.release(body)
-		writeJSON(w, code, res)
-	}
-	mu.HandleFunc("/internal/settle", settle)
-
 	if !dev {
-		// A deployed role: the mesh listener and nothing else.  No static files,
-		// no public API.
-		return gzipMiddleware(mu)
+		// A deployed role starts no listener and registers no route; the caller
+		// checks for nil before constructing a server.  Ops visibility stays on
+		// the validators' mesh /status.
+		return nil
 	}
 
 	// ---- dev only: the retired public surface, kept for the dev UI ----
-	//
-	// The two settlement entry points may share one handler in dev: they are
-	// the same operation, and dev is a single-host convenience.
-	mu.HandleFunc("/api/settle", settle)
-
 	mintURL, _ := url.Parse(d.mint)
 	mp := httputil.NewSingleHostReverseProxy(mintURL)
 	mu.Handle("/mint/", http.StripPrefix("/mint", mintHandler(mp)))
@@ -249,6 +225,11 @@ func gatewayMux(d gatewayDeps, dev bool) http.Handler {
 			writeJSON(w, 400, map[string]string{"error": "invalid signed event"})
 			return
 		}
+		tx, err := EventTransaction(event)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
 		validators := make([]validatorRPC, 0, 4)
 		for i := range 4 {
 			if d.sup.running(i) {
@@ -261,7 +242,7 @@ func gatewayMux(d gatewayDeps, dev bool) http.Handler {
 		if d.pub != nil {
 			pub = d.pub
 		}
-		status, out := submitTx(r.Context(), client, validators, event, compact.Bytes(), pub)
+		status, out := submitTx(r.Context(), client, validators, event, tx, pub)
 		writeJSON(w, status, out)
 	})
 
@@ -334,6 +315,18 @@ func gatewayMux(d gatewayDeps, dev bool) http.Handler {
 	})
 
 	return gzipMiddleware(mu)
+}
+
+// gatewayServer builds the dev HTTP server.  A deployed gateway (dev=false)
+// starts no listener, so this returns nil; the caller then never calls
+// ListenAndServe.  Keeping it a pure function makes the deployed role testable
+// without starting a process.
+func gatewayServer(dev bool, addr string, handler http.Handler) *http.Server {
+	if !dev {
+		return nil
+	}
+	return &http.Server{Addr: addr, Handler: handler,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
 }
 
 // validatorURL is the internal mesh URL of validator i's HTTP listener.  The

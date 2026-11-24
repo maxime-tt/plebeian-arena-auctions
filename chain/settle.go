@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 const settlePrefix = "settle:"
@@ -57,6 +58,51 @@ func parseSettle(tx []byte) (*settleTx, bool) {
 		return nil, false
 	}
 	return &st, true
+}
+
+// settlementCarrier is the kind-1452 content: exactly the existing settleTx
+// payload plus the schema string.  A courier publishes it; the chain turns it
+// into the settle tx EventTransaction submits, so CheckTx/FinalizeBlock see the
+// same parseSettle bytes as a direct settle tx.
+type settlementCarrier struct {
+	Schema  string  `json:"schema"`
+	Bid     string  `json:"bid"`
+	Outcome string  `json:"outcome"`
+	Proofs  []Proof `json:"proofs"`
+	Sig     string  `json:"sig"`
+}
+
+// parseSettlementCarrier validates a 1452 content string and returns the
+// settleTx it carries.  The guards mirror parseSettle: lowercase ids, the two
+// outcomes, 1..maxOutProofs(64) proofs, and the produced settle: bytes within
+// 256 KiB.
+func parseSettlementCarrier(content string) (*settleTx, error) {
+	var c settlementCarrier
+	dec := json.NewDecoder(strings.NewReader(content))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSettlementCarrierBadPayload, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("%w: trailing JSON", ErrSettlementCarrierBadPayload)
+	}
+	if c.Schema != SettlementCarrierSchema {
+		return nil, fmt.Errorf("%w: %q", ErrSettlementCarrierBadSchema, c.Schema)
+	}
+	if !lowerHex(c.Bid, 64) || !lowerHex(c.Sig, 128) {
+		return nil, fmt.Errorf("%w: bid and sig must be lowercase hex", ErrSettlementCarrierBadPayload)
+	}
+	if c.Outcome != "settle" && c.Outcome != "refund" {
+		return nil, fmt.Errorf("%w: outcome %q", ErrSettlementCarrierBadPayload, c.Outcome)
+	}
+	if len(c.Proofs) < 1 || len(c.Proofs) > 64 {
+		return nil, fmt.Errorf("%w: proofs count %d", ErrSettlementCarrierBadPayload, len(c.Proofs))
+	}
+	st := &settleTx{Bid: c.Bid, Outcome: c.Outcome, Proofs: c.Proofs, Sig: c.Sig}
+	if len(makeSettle(st)) > 256<<10 {
+		return nil, fmt.Errorf("%w: settle tx exceeds 256 KiB", ErrSettlementCarrierBadPayload)
+	}
+	return st, nil
 }
 
 func makeSettle(st *settleTx) []byte {
