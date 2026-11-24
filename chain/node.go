@@ -770,13 +770,40 @@ func settlementElected(validators []ValidatorKey, myPubkey string) bool {
 	return strings.ToLower(myPubkey) == smallest
 }
 
+// signerState is the signing pass's memory: the (bid, outcome) pairs already signed, and a
+// per-move backoff for those the round keeps refusing.  The backoff is what keeps a
+// permanently unsettleable legacy escrow (a template whose amounts are not pinned
+// denominations) from logging once per second for the life of the process.
+type signerState struct {
+	signed map[string]bool
+	fails  map[string]int
+	next   map[string]int64
+}
+
+func newSignerState() *signerState {
+	return &signerState{signed: map[string]bool{}, fails: map[string]int{}, next: map[string]int64{}}
+}
+
+// signerRetryInSec grows 5s -> 5min with each consecutive refusal of a move, so a
+// deterministic refusal costs one log line every five minutes instead of one per second.
+func signerRetryInSec(fails int) int64 {
+	sec := int64(5)
+	for n := 1; n < fails && sec < 300; n++ {
+		sec *= 2
+	}
+	if sec > 300 {
+		sec = 300
+	}
+	return sec
+}
+
 // runSettlementSigner is the 1 s signing pass beside runCloser.  It reads the
 // committed snapshot, takes the due outcomes, and -- only when this node is the
 // elected coordinator -- collects one FROST signature and publishes kind 1451.
 // The in-memory signed set makes a repeated tick idempotent; a restart publishes
 // a fresh valid aggregate (fresh nonces), which readers dedupe by digest.
 func runSettlementSigner(stop <-chan struct{}, app *App, pub *Publisher, signer committeeSigner, validators []ValidatorKey, myPubkey string) {
-	signed := map[string]bool{}
+	state := newSignerState()
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
@@ -785,13 +812,13 @@ func runSettlementSigner(stop <-chan struct{}, app *App, pub *Publisher, signer 
 			return
 		case <-t.C:
 		}
-		settlementTick(app, pub, signer, validators, myPubkey, signed)
+		settlementTick(app, pub, signer, validators, myPubkey, state)
 	}
 }
 
 // settlementTick performs one signing pass.  It makes NO mint call: the chain
 // only signs and publishes the committee signature.
-func settlementTick(app *App, pub *Publisher, signer committeeSigner, validators []ValidatorKey, myPubkey string, signed map[string]bool) {
+func settlementTick(app *App, pub *Publisher, signer committeeSigner, validators []ValidatorKey, myPubkey string, state *signerState) {
 	if pub == nil || !settlementElected(validators, myPubkey) {
 		return
 	}
@@ -804,24 +831,34 @@ func settlementTick(app *App, pub *Publisher, signer committeeSigner, validators
 		return
 	}
 	st.Height, st.Time = height, blockTime
-	for _, move := range st.dueMoves(time.Now().Unix()) {
+	now := time.Now().Unix()
+	for _, move := range st.dueMoves(now) {
 		key := move.Bid.ID + "|" + move.Outcome
 		if move.Bid.Settled != "" {
 			// The escrow moved: the key is dead. Drop it so a validator running
 			// for months does not accumulate one entry per settlement.
-			delete(signed, key)
+			delete(state.signed, key)
+			delete(state.fails, key)
+			delete(state.next, key)
 			continue
 		}
-		if signed[key] {
+		if state.signed[key] {
+			continue
+		}
+		if until := state.next[key]; until > now {
 			continue
 		}
 		code, res := signer.Release(SignReq{Bid: move.Bid.ID, Outcome: move.Outcome, Height: height})
 		if code != 200 || res.Signature == "" {
+			state.fails[key]++
+			state.next[key] = now + signerRetryInSec(state.fails[key])
 			log.Printf("settlement signer: %s %s: %d %s", move.Bid.ID, move.Outcome, code, res.Error)
 			continue
 		}
 		_, outs, err := st.settlementOutputs(move.Bid, move.Outcome)
 		if err != nil {
+			state.fails[key]++
+			state.next[key] = now + signerRetryInSec(state.fails[key])
 			log.Printf("settlement signer: %s %s: %v", move.Bid.ID, move.Outcome, err)
 			continue
 		}
@@ -846,14 +883,20 @@ func settlementTick(app *App, pub *Publisher, signer committeeSigner, validators
 		// reason to sign someone else's message).
 		h := sha256Sum(sigAllMessage(move.Bid.Proofs, outs))
 		if !schnorrVerifyHash(h[:], st.Params.GroupKey, res.Signature) {
+			state.fails[key]++
+			state.next[key] = now + signerRetryInSec(state.fails[key])
 			log.Printf("settlement signer: %s %s: aggregate does not cover the committed digest", move.Bid.ID, move.Outcome)
 			continue
 		}
 		if err := pub.PublishCommitteeSignature(context.Background(), content); err != nil {
+			state.fails[key]++
+			state.next[key] = now + signerRetryInSec(state.fails[key])
 			log.Printf("settlement signer: publish %s %s: %v", move.Bid.ID, move.Outcome, err)
 			continue
 		}
-		signed[key] = true
+		state.signed[key] = true
+		delete(state.fails, key)
+		delete(state.next, key)
 	}
 }
 

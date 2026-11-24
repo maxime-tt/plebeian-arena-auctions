@@ -63,8 +63,8 @@ func TestDueOutcomeSignsWithZeroHTTPToApiSettle(t *testing.T) {
 		t.Fatal(err)
 	}
 	signer := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: groupSign(t, sigAllMessage(bid.Proofs, outs))}}
-	signed := map[string]bool{}
-	settlementTick(a, pub, signer, validators, myKey, signed)
+	state := newSignerState()
+	settlementTick(a, pub, signer, validators, myKey, state)
 
 	if signer.calls != 1 {
 		t.Fatalf("signer calls = %d, want 1", signer.calls)
@@ -72,7 +72,7 @@ func TestDueOutcomeSignsWithZeroHTTPToApiSettle(t *testing.T) {
 	if got := len(eventsOfKind(rec, KindCommitteeSignature)); got != 1 {
 		t.Fatalf("published committee-signature events = %d, want 1", got)
 	}
-	if !signed[ev1.ID+"|refund"] {
+	if !state.signed[ev1.ID+"|refund"] {
 		t.Fatal("the (bid, outcome) must be recorded as signed")
 	}
 }
@@ -157,6 +157,35 @@ func otherPinnedAmount(t *testing.T, keys map[string]string, not int64) int64 {
 	return best
 }
 
+// TestARefusedOutcomeIsBackedOff pins the retry shape: a move the round keeps refusing must
+// NOT be retried on every tick, or a permanently unsettleable legacy escrow logs once a
+// second for the life of the process.
+func TestARefusedOutcomeIsBackedOff(t *testing.T) {
+	a, _, _, _ := dueRefundApp(t)
+	rec := &recordingRelay{}
+	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 2 })
+	myKey := newBidder(t).pub
+	validators := []ValidatorKey{{Pubkey: myKey}}
+	state := newSignerState()
+	fail := &fakeCommitteeSigner{code: 409, res: releaseResult{Error: "refused"}}
+
+	settlementTick(a, pub, fail, validators, myKey, state)
+	if fail.calls != 1 {
+		t.Fatalf("signer calls = %d, want 1", fail.calls)
+	}
+	// A second tick inside the backoff window must not reach the round again.
+	settlementTick(a, pub, fail, validators, myKey, state)
+	if fail.calls != 1 {
+		t.Fatalf("a backed-off move was retried immediately: calls = %d", fail.calls)
+	}
+	if got := signerRetryInSec(1); got != 5 {
+		t.Fatalf("first retry = %ds, want 5", got)
+	}
+	if got := signerRetryInSec(20); got != 300 {
+		t.Fatalf("retry after many failures = %ds, want the 300s cap", got)
+	}
+}
+
 // TestAggregateForAnotherDigestIsNotPublished: a round that aggregates a
 // message other than this node's committed digest must not produce a 1451 —
 // the fact would carry a digest its own signature does not cover.
@@ -166,16 +195,16 @@ func TestAggregateForAnotherDigestIsNotPublished(t *testing.T) {
 	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 2 })
 	myKey := newBidder(t).pub
 	validators := []ValidatorKey{{Pubkey: myKey}}
-	signed := map[string]bool{}
+	state := newSignerState()
 
 	// A valid group signature, but over a different message.
 	bad := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: groupSign(t, "another message entirely")}}
-	settlementTick(a, pub, bad, validators, myKey, signed)
+	settlementTick(a, pub, bad, validators, myKey, state)
 
 	if got := len(eventsOfKind(rec, KindCommitteeSignature)); got != 0 {
 		t.Fatalf("an aggregate over another digest published %d events, want 0", got)
 	}
-	if signed[ev1.ID+"|refund"] {
+	if state.signed[ev1.ID+"|refund"] {
 		t.Fatal("an inconsistent aggregate must not mark the outcome signed")
 	}
 }
@@ -190,7 +219,7 @@ func TestRestartMidRoundDoesNotRepublishAggregate(t *testing.T) {
 	pub := newTestPublisher(t, a, rec, StateCommitEvery, 0, func() int64 { return tNow + 2 })
 	myKey := newBidder(t).pub
 	validators := []ValidatorKey{{Pubkey: myKey}}
-	signed := map[string]bool{}
+	state := newSignerState()
 	bid := a.st.Bids[ev1.ID]
 	_, outs, err := a.st.settlementOutputs(bid, "refund")
 	if err != nil {
@@ -198,20 +227,23 @@ func TestRestartMidRoundDoesNotRepublishAggregate(t *testing.T) {
 	}
 
 	fail := &fakeCommitteeSigner{code: 500, res: releaseResult{Error: "mesh down"}}
-	settlementTick(a, pub, fail, validators, myKey, signed)
+	settlementTick(a, pub, fail, validators, myKey, state)
 	if got := len(eventsOfKind(rec, KindCommitteeSignature)); got != 0 {
 		t.Fatalf("a failed round published %d events, want 0", got)
 	}
-	if signed[ev1.ID+"|refund"] {
+	if state.signed[ev1.ID+"|refund"] {
 		t.Fatal("a failed round must not mark the outcome signed")
 	}
 
 	ok := &fakeCommitteeSigner{code: 200, res: releaseResult{Signature: groupSign(t, sigAllMessage(bid.Proofs, outs))}}
-	settlementTick(a, pub, ok, validators, myKey, signed)
+	// A restart is a NEW process: the in-memory signed/backoff maps are gone, so the
+	// pass runs the round again even though the previous one failed (and was backed off).
+	restarted := newSignerState()
+	settlementTick(a, pub, ok, validators, myKey, restarted)
 	if got := len(eventsOfKind(rec, KindCommitteeSignature)); got != 1 {
 		t.Fatalf("after restart published %d events, want 1", got)
 	}
-	settlementTick(a, pub, ok, validators, myKey, signed)
+	settlementTick(a, pub, ok, validators, myKey, restarted)
 	if got := len(eventsOfKind(rec, KindCommitteeSignature)); got != 1 {
 		t.Fatalf("a second tick republished: %d events, want 1", got)
 	}
