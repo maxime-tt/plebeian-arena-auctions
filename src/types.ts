@@ -129,12 +129,20 @@ export interface ReceiptOut {
   dleq: Dleq | null;
 }
 
+/**
+ * One carried proof: the chain's own `Proof` shape — `ReceiptOut` minus the recipient.
+ * The recipient is derivable from `secret`, and the chain's carrier parser
+ * (`parseSettlementCarrier`, `DisallowUnknownFields`) refuses an extra field by name:
+ * "bad_settlement_carrier_payload: json: unknown field \"recipient\"". So it must not ride.
+ */
+export type CarrierProof = Omit<ReceiptOut, "recipient">;
+
 /** Kind 1452 content — a carried settlement transaction (contract §3). */
 export interface SettlementCarrierContent {
   schema: "arena.settlement.v1";
   bid: string;
   outcome: "settle" | "refund";
-  proofs: ReceiptOut[];
+  proofs: CarrierProof[];
   sig: string;
 }
 

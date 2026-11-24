@@ -121,7 +121,12 @@ describe("buildCarrier (contract §3/§5)", () => {
     expect(carrier.schema).toBe("arena.settlement.v1");
     expect(carrier.bid).toBe(committee.bid);
     expect(carrier.sig).toBe(committee.signature);
-    expect(carrier.proofs).toEqual([proof]);
+    // The chain's carrier parser is DisallowUnknownFields over `settleTx`, whose proofs are
+    // Cashu proofs — so `recipient` (derivable from `secret`) must NOT ride along. Without
+    // this the live chain dropped every carrier: 'json: unknown field "recipient"'.
+    const { recipient: _recipient, ...chainProof } = proof;
+    expect(carrier.proofs).toEqual([chainProof]);
+    expect(Object.keys(carrier.proofs[0]!).sort()).toEqual(["C", "amount", "dleq", "id", "secret"]);
   });
 
   it("refuses an over-long proof list", () => {

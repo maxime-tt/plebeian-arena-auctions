@@ -140,7 +140,7 @@ export function buildCarrier(
     schema: SETTLEMENT_SCHEMA,
     bid: committee.bid,
     outcome: committee.outcome,
-    proofs,
+    proofs: proofs.map(({ id, amount, secret, C, dleq }) => ({ id, amount, secret, C, dleq })),
     sig: committee.signature,
   };
 }
