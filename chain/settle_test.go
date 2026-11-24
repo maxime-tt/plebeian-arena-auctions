@@ -1,9 +1,9 @@
 package main
 
 // v0.5.0 + 2-of-2 tests (ADR 0009, spec §4/§5): anti-snipe resets with no cap,
-// fixed lots never move, push settlement through the bidder's COMMITTED
-// outcome templates (the settler is an executor), the push signing policy
-// over committed outputs, and the coordinator's majority pick.
+// fixed lots never move, settlement through the bidder's COMMITTED
+// outcome templates (the committed template is the only author), the signing
+// policy over committed outputs, and the coordinator's majority pick.
 
 import (
 	"context"

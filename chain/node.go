@@ -806,7 +806,13 @@ func settlementTick(app *App, pub *Publisher, signer committeeSigner, validators
 	st.Height, st.Time = height, blockTime
 	for _, move := range st.dueMoves(time.Now().Unix()) {
 		key := move.Bid.ID + "|" + move.Outcome
-		if move.Bid.Settled != "" || signed[key] {
+		if move.Bid.Settled != "" {
+			// The escrow moved: the key is dead. Drop it so a validator running
+			// for months does not accumulate one entry per settlement.
+			delete(signed, key)
+			continue
+		}
+		if signed[key] {
 			continue
 		}
 		code, res := signer.Release(SignReq{Bid: move.Bid.ID, Outcome: move.Outcome, Height: height})

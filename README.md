@@ -7,11 +7,14 @@ validators order every listing and bid. Each bid is real Cashu ecash locked to a
 so the committee can move the money **only to those two destinations**: the
 bidder's honest pre-signing plus the chain's admission rule, which refuses any
 other template (the mint itself has no concept of a destination — spec §1.3).
-The validators' settler is an **executor, not an author**: it
-submits a pre-signed outcome and nothing else. The public surface is
+The committee is an **executor, not an author**: the elected coordinator
+validator signs a committed outcome's digest and publishes it as a fact (kind 1451), and any
+courier — the facilitator service, or the recipient's own wallet — carries that signature to
+the mint as kind 1452. Nothing is built and no destination is chosen: the bidder's own
+pre-signature fixed both. The public surface is
 **relay-only**: clients publish signed Nostr events to relays and read every fact
-from relays; the gateway's HTTP surface is retired to a mesh-internal listener
-plus a dev-only static/API mode. Fake sats only.
+from relays; a deployed gateway is a validator supervisor with **no HTTP surface at all**,
+and a dev-only static/API mode exists for single-host runs. Fake sats only.
 
 The normative external protocol is
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md); code comments that cite `spec §N` refer to
@@ -39,7 +42,7 @@ Nutshell 0.21 mint :3338 (FakeWallet, NUT-10 P2PK, NUT-11 SIG_ALL)
 - Bid validity (deterministic, on every validator): signed by the bidder; ≥ high + step (`MinIncrementBps`, default 200 = 2%); not the seller; DLEQ-verified proofs from the pinned keyset; unspent-on-chain; sum = amount; the 2-of-2 lock above; the bid carries its two pre-signed outcome templates and every validator re-derives each template digest and re-checks the bidder's signature at admission. A **single strict parser** (`strictTemplateOutput`) enforces the destination and the canonical NUT-11 tag set for every settle and refund output, at admission, at settle verification and before the FROST policy signs; it refuses `pubkeys`, `n_sigs` other than `1`, `refund`, `n_sigs_refund`, `locktime`, non-canonical bytes, and any output `Amount` that is not a pinned keyset denomination.
 - **Lock floor is 915 s and there is no re-lock.** A bid's `locktime` must clear the end the bid itself establishes by exactly `SettlementSafetySec` (900) + `BidToConsensusLatencySec` (15); a bid that does not clear it is invalid and silently dropped.
 - Two auction modes ([ADR 0009](docs/adr/0009-push-settlement-two-auction-modes.md), **chain format 6**): **fixed time** ends on the clock and never later; **anti-snipe** puts the clock back to the seller's window (60 s to 900 s) only when a bid **takes the lead**, with no cap and no hidden hard end. A bid by the current leader is a position raise and does **not** move `EndAt` or increment `Extensions`.
-- Push settlement (v0.5.0) as an **executor**: the settler asks all four validators to co-sign a bid's pre-signed refund or settle template and uses the first three that agree. It swaps at the mint, checks the DLEQ proofs, records a `settle` transaction, and publishes a receipt (kind 1443/1444) on the relay. It builds no outputs and chooses no destination. Measured locally: FROST round 10–30 ms, mint swap about 25 ms.
+- Settlement (v0.6.0): **the chain never touches the mint.** When a block makes an outcome due, the elected coordinator (the smallest roster pubkey) runs a FROST round over the bid's committed template digest and publishes the committee signature (kind 1451). An executor — the facilitator service, or the recipient's own wallet — posts the swap to the mint with that signature plus the bidder's committed pre-signature, unblinds the answer, and carries it back as kind 1452; the chain re-verifies it against the committed template and records the settle transaction, and the validators publish the receipt (kind 1443/1444). Nothing builds an output and nobody chooses a destination — the bidder's pre-signature fixed both. Measured locally: FROST round 10–30 ms, mint swap about 25 ms.
 - Nostr login (v0.5.0, [ADR 0010](docs/adr/0010-nostr-login-one-click-lots.md)): NIP-07 extensions and NIP-46 signers (`bunker://`, `nostrconnect://`). You bid as yourself beside the demo characters, with the same fake sats; your wallet key stays in this browser. Your name and picture come from your own relays. One-click lots list a random parody lot (Bitcoin merch "sold" by leaders of the past) in either mode.
 - Fixes (v0.5.2, ADR 0011 addendum): the wallet worker now says "ready" before the page sends it anything. iOS dropped the early start-up message, so every top-up and bid failed with "wallet worker: unknown op". If the worker never gets ready, the wallet runs in the page.
 - Fixes (v0.5.1, [ADR 0011](docs/adr/0011-wallet-resync-after-lost-storage.md)): a wallet whose browser store was cleared (counters back at 0, so the mint refused "outputs already signed") repairs itself with Cashu restore (NUT-09) and gets its unspent ecash back. Top-up and bot failures now show. The photo and gallery follow the next lot the moment it takes over. The outcome panel closes when the next lot starts. The demo Seller no longer bids.

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -52,6 +53,12 @@ type supervisor struct {
 	// reached at, so a restart rebuilds the same -mesh-host the initial start
 	// used (see nodeArgs).
 	meshHost string
+	// meshPeers are the peers' mesh listeners, in index order 1..4, that a
+	// validator's elected coordinator posts FROST rounds to. Kept for the same
+	// reason as meshHost: on a deployed (non-loopback) mesh every node must be
+	// told the FIPS addresses, or the coordinator dials a loopback nobody
+	// listens on and never publishes a kind-1451.
+	meshPeers string
 }
 
 // nodeArgs builds the argv for validator i (0-based).  It is the ONE place the
@@ -59,7 +66,7 @@ type supervisor struct {
 // restart cannot drift: a restarted validator that lost its -relay flag comes
 // back with no relay observer (so no ingest), no verdict publisher, no state
 // commitments and no params event -- a second-class node that only p2p-syncs.
-func nodeArgs(root string, i int, relays []string, commitMax time.Duration, meshHost string) []string {
+func nodeArgs(root string, i int, relays []string, commitMax time.Duration, meshHost, meshPeers string) []string {
 	args := []string{"node", "-root", root, "-i", fmt.Sprint(i + 1)}
 	for _, relay := range relays {
 		args = append(args, "-relay", relay)
@@ -73,13 +80,37 @@ func nodeArgs(root string, i int, relays []string, commitMax time.Duration, mesh
 	if meshHost != "" {
 		args = append(args, "-mesh-host", meshHost)
 	}
+	// The peers' mesh addresses are what the ELECTED coordinator dials for a
+	// FROST round.  They must be forwarded for the same reason as mesh-host: a
+	// node left on the loopback default cannot reach any peer on a deployed
+	// mesh, so no committee signature would ever be published.
+	if meshPeers != "" {
+		args = append(args, "-mesh-peers", meshPeers)
+	}
 	return args
+}
+
+// meshPeersAreLoopback reports whether every named peer address is loopback.
+// Dev mode is a single-host run, so a FIPS peer list there would have the
+// coordinator dial an address nothing listens on.
+func meshPeersAreLoopback(raw string) bool {
+	peers, err := parseMeshPeers(raw)
+	if err != nil {
+		return false
+	}
+	for _, p := range peers {
+		host, _, err := net.SplitHostPort(p)
+		if err != nil || !isLoopbackHost(host) {
+			return false
+		}
+	}
+	return true
 }
 
 // argsFor is the argv a start of validator i uses.  Both the initial start and
 // the demo-control restart go through here.
 func (s *supervisor) argsFor(i int) []string {
-	return nodeArgs(s.root, i, s.relays, s.commitMax, s.meshHost)
+	return nodeArgs(s.root, i, s.relays, s.commitMax, s.meshHost, s.meshPeers)
 }
 
 func (s *supervisor) start(i int) error {
@@ -167,11 +198,18 @@ func cmdGateway(args []string) {
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint")
 	dev := fs.Bool("dev", false, "DEV ONLY: serve the repository's public UI/probe routes (/api/*, /mint/) and the static UI. A deployed gateway serves none of them and no static files; dev mode is never a deployed role.")
 	meshHost := fs.String("mesh-host", "127.0.0.1", "address the internal validator mesh listeners are reached at (the node's FIPS address on a deployed node, loopback on a single host)")
+	meshPeers := fs.String("mesh-peers", defaultMeshPeers(), "comma-separated host:port of the four validators' mesh listeners in index order 1..4 (the FIPS addresses on a deployed node; loopback on a single host)")
 	demo := fs.Bool("demo-controls", false, "expose the unauthenticated validator stop/start route (dev/demo only, never on a real-sats deployment)")
 	commitMaxInterval := fs.Duration("commit-max-interval", StateCommitMaxInterval, "maximum wall-clock gap between state commitments")
 	var relays relayURLs
 	fs.Var(&relays, "relay", "relay websocket URL clients publish to (repeatable); the relay is the primary transport")
 	fs.Parse(args)
+
+	// A malformed peer list must not reach the nodes: they would fall back to
+	// per-index loopback defaults silently.
+	if _, err := parseMeshPeers(*meshPeers); err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
 
 	// A deployed gateway is the validator supervisor only: it starts no HTTP
 	// listener and registers no route.  Dev mode keeps the public UI/probe
@@ -190,11 +228,16 @@ func cmdGateway(args []string) {
 			// the dev UI talk to nothing.
 			log.Fatalf("gateway: -dev requires a loopback -mesh-host (got %s): dev mode is a single-host run", *meshHost)
 		}
+		// Same rule for the peers' addresses: dev is one host, so a FIPS peer
+		// list here would have the coordinator dial addresses nothing listens on.
+		if !meshPeersAreLoopback(*meshPeers) {
+			log.Fatalf("gateway: -dev requires a loopback -mesh-peers (got %s): dev mode is a single-host run", *meshPeers)
+		}
 		log.Printf("gateway: DEV MODE on %s: serving the public /api/* and /mint/ routes and the static UI; this is NOT a deployed role", *addr)
 	}
 
 	bin, _ := os.Executable()
-	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root), relays: relays, commitMax: *commitMaxInterval, meshHost: *meshHost}
+	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root), relays: relays, commitMax: *commitMaxInterval, meshHost: *meshHost, meshPeers: *meshPeers}
 	for i := range 4 {
 		check(sup.start(i))
 	}
