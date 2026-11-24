@@ -854,7 +854,17 @@ func (p *Publisher) PublishCommitteeSignature(ctx context.Context, c CommitteeSi
 	if !ok || blockHash == "" {
 		return errPublisher("committee signature: committed block hash unavailable")
 	}
+	// TWO external sources hand this fact upper-case hex: the CometBFT block store prints
+	// block hashes UPPER case, and the arena-frost binary returns an upper-case aggregate,
+	// while the fact's own schema (and the app's parser) demand lower-case hex. Normalise at
+	// this boundary — refusing instead is what left the deployed root with no kind-1451 at
+	// all. Length stays enforced by BuildCommitteeSignatureEvent's lowerHex checks.
+	blockHash = strings.ToLower(blockHash)
 	c.BlockHash = blockHash
+	c.Bid = strings.ToLower(c.Bid)
+	c.AppHash = strings.ToLower(c.AppHash)
+	c.Digest = strings.ToLower(c.Digest)
+	c.Signature = strings.ToLower(c.Signature)
 	ev, err := BuildCommitteeSignatureEvent(p.key, c, p.now())
 	if err != nil {
 		return err

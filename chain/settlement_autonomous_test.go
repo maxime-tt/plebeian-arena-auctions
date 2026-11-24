@@ -157,6 +157,54 @@ func otherPinnedAmount(t *testing.T, keys map[string]string, not int64) int64 {
 	return best
 }
 
+// TestCommitteeSignatureNormalisesTheStoreCase is the live-run regression: the CometBFT block
+// store prints hex UPPER case and the FROST binary returns an upper-case aggregate, while the
+// fact's own schema (and the app's parser) demand lower-case hex. Publishing must normalise
+// rather than refuse — refusing is what left the deployed root with no kind-1451 at all.
+func TestCommitteeSignatureNormalisesTheStoreCase(t *testing.T) {
+	a, _, _, ev1 := dueRefundApp(t)
+	bid := a.st.Bids[ev1.ID]
+	_, outs, err := a.st.settlementOutputs(bid, "refund")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := make([]CommitteeSignatureInput, len(bid.Proofs))
+	for i, p := range bid.Proofs {
+		inputs[i] = CommitteeSignatureInput{Secret: p.Secret, C: p.C}
+	}
+	outputs := make([]CommitteeSignatureOutput, len(outs))
+	for i, o := range outs {
+		outputs[i] = CommitteeSignatureOutput{Amount: o.Amount, B: o.B}
+	}
+	rec := &recordingRelay{}
+	pub, err := NewPublisher(PublisherConfig{
+		Key: testVerifierKey(t), Relay: rec, App: a, Every: StateCommitEvery,
+		// Exactly what the real BlockStore returns.
+		BlockHash: func(height int64) (string, bool) { return strings.ToUpper(testBlockHash(height)), true },
+		Now:       func() int64 { return tNow + 2 },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := CommitteeSignatureContent{
+		Schema: CommitteeSignatureSchema, Bid: bid.ID, Auction: bid.Auction, Outcome: "refund",
+		Height: 11, AppHash: testBlockHash(99),
+		Digest: committeeSignatureDigest(inputs, outputs), Signature: strings.ToUpper(groupSign(t, sigAllMessage(bid.Proofs, outs))),
+		Inputs: inputs, Outputs: outputs,
+	}
+	if err := pub.PublishCommitteeSignature(context.Background(), content); err != nil {
+		t.Fatalf("an upper-case store hash and aggregate must publish, not refuse: %v", err)
+	}
+	evs := eventsOfKind(rec, KindCommitteeSignature)
+	if len(evs) != 1 {
+		t.Fatalf("committee-signature events = %d, want 1", len(evs))
+	}
+	// The published fact is lower-case throughout, so the app's strict parser accepts it.
+	if _, err := ParseCommitteeSignature(evs[0], map[string]ValidatorKey{evs[0].Pubkey: {Pubkey: evs[0].Pubkey}}, a.st.Params.GroupKey); err != nil {
+		t.Fatalf("the published fact must parse back: %v", err)
+	}
+}
+
 // TestARefusedOutcomeIsBackedOff pins the retry shape: a move the round keeps refusing must
 // NOT be retried on every tick, or a permanently unsettleable legacy escrow logs once a
 // second for the life of the process.
