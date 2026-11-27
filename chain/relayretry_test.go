@@ -125,7 +125,7 @@ func TestObserverRetriesTransientSubmitFailure(t *testing.T) {
 	if since, _ := cursor.since("ws://retry.example"); !since.IsZero() {
 		t.Fatalf("cursor advanced to %s while the submit was still failing", since)
 	}
-	if committed, _, _ := observer.Stats(); committed != 0 {
+	if committed, _, _, _ := observer.Stats(); committed != 0 {
 		t.Fatalf("committed = %d before the node was ready, want 0", committed)
 	}
 
@@ -174,7 +174,7 @@ func TestObserverDropsTerminalRejection(t *testing.T) {
 	if dropped := observer.Dropped(); dropped != 1 {
 		t.Fatalf("dropped = %d, want 1", dropped)
 	}
-	if _, _, lastError := observer.Stats(); lastError == nil {
+	if _, _, _, lastError := observer.Stats(); lastError == nil {
 		t.Fatal("terminal rejection was not recorded as the last error")
 	}
 	since, id := cursor.since("ws://drop.example")
@@ -188,7 +188,7 @@ func TestObserverDropsTerminalRejection(t *testing.T) {
 	if attempts := submitter.Attempts(event.ID); attempts != 1 {
 		t.Fatalf("terminal rejection was submitted %d times, want exactly 1", attempts)
 	}
-	if committed, _, _ := observer.Stats(); committed != 0 {
+	if committed, _, _, _ := observer.Stats(); committed != 0 {
 		t.Fatalf("committed = %d, want 0 for a rejected event", committed)
 	}
 }
@@ -225,7 +225,7 @@ func TestCursorHoldsBehindAnUnsettledEvent(t *testing.T) {
 	observer.HandleForTest(ctx, &olderEvent) // transient: queued for retry
 	observer.HandleForTest(ctx, &newerEvent) // commits
 
-	if committed, _, _ := observer.Stats(); committed != 1 {
+	if committed, _, _, _ := observer.Stats(); committed != 1 {
 		t.Fatalf("committed = %d, want 1 (only the newer event)", committed)
 	}
 	// The newer event is settled, but the older one is not, so the persisted
@@ -389,7 +389,7 @@ func TestObserverDropsAppRejectionAfterTheCap(t *testing.T) {
 	if attempts := submitter.Attempts(event.ID); attempts != maxAppRetries {
 		t.Fatalf("attempts = %d, want exactly maxAppRetries = %d", attempts, maxAppRetries)
 	}
-	if committed, _, _ := observer.Stats(); committed != 0 {
+	if committed, _, _, _ := observer.Stats(); committed != 0 {
 		t.Fatalf("committed = %d, want 0 for a permanently rejected event", committed)
 	}
 	waitFor(t, 5*time.Second, func() bool {
@@ -481,7 +481,7 @@ func TestRelayCursorPersistsAndResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, lastSeen, _ := observer.Stats(); lastSeen.Unix() != createdAt {
+	if _, lastSeen, _, _ := observer.Stats(); lastSeen.Unix() != createdAt {
 		t.Fatalf("observer lastSeen = %s, want %s (seeded from the cursor)", lastSeen, time.Unix(createdAt, 0).UTC())
 	}
 

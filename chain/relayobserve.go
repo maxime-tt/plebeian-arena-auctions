@@ -62,6 +62,30 @@ type ObserverConfig struct {
 	Submitter Submitter
 	// Kinds overrides the subscribed kinds; defaults to RelayKinds.
 	Kinds []int
+	// ProbeKinds are kinds subscribed for liveness only: they are never
+	// submitted, never enter the id de-dupe set, and never advance the durable
+	// cursor.  A kind that is also in Kinds is not a probe kind.  nil defaults
+	// to []int{KindStateCommit}: every validator publishes a state commitment
+	// (1447) about every 10 s, so receiving one is a real round trip over the
+	// relay and needs no protocol change.
+	//
+	// The outage this closes (2026-11-24..27): an observer's TCP socket went
+	// half-open and delivered nothing more.  go-nostr surfaces no error for
+	// that, so the receive loop blocked on subscription.Events forever, Run's
+	// reconnect loop never ran, and a kind-1440 create published 2026-11-27 was
+	// silently never submitted -- no log line, the cursor frozen -- until a
+	// manual restart replayed it.  A kind the relay already carries every 10 s
+	// is the cheapest possible proof the socket is still moving bytes.
+	ProbeKinds []int
+	// IdleTimeout is how long a session may receive no frame at all before it
+	// is torn down and resubscribed.  It is what turns the half-open socket
+	// above into a visible reconnect: a dead subscription stops carrying the
+	// 10 s probe, the deadline fires, Run logs `session ended: …` and dials
+	// again, and the durable cursor makes the replay lossless.  Any frame --
+	// a real event or a probe -- resets it, so a healthy relay never trips it.
+	// Zero takes defaultIdleTimeout; a negative value disables the deadline,
+	// which tests use to run session() without a real clock.
+	IdleTimeout time.Duration
 	// Since is the earliest created_at to request on the first subscribe.  It
 	// advances as events are seen so a reconnect only re-fetches the window it
 	// might have missed.  Zero means "from the beginning of the relay".
@@ -94,8 +118,14 @@ type ObserverConfig struct {
 type Observer struct {
 	config ObserverConfig
 
+	// connect opens one subscription: connectAndSubscribe in production, a
+	// scripted fake in tests.  It is a seam so the idle deadline and the
+	// resubscribe it causes can be exercised without a socket.
+	connect func(ctx context.Context, url string, filters nostr.Filters) (*relaySubscription, error)
+
 	mu         sync.Mutex
 	lastSeen   time.Time
+	lastFrame  time.Time
 	seenIDs    map[string]struct{}
 	submitted  int
 	dropped    int
@@ -129,6 +159,12 @@ func NewObserver(config ObserverConfig) (*Observer, error) {
 	if len(config.Kinds) == 0 {
 		config.Kinds = append([]int(nil), RelayKinds...)
 	}
+	if config.ProbeKinds == nil {
+		config.ProbeKinds = []int{KindStateCommit}
+	}
+	if config.IdleTimeout == 0 {
+		config.IdleTimeout = defaultIdleTimeout
+	}
 	if config.ReconnectDelay <= 0 {
 		config.ReconnectDelay = time.Second
 	}
@@ -138,7 +174,7 @@ func NewObserver(config ObserverConfig) (*Observer, error) {
 	if config.Logger == nil {
 		config.Logger = log.Default()
 	}
-	observer := &Observer{config: config, seenIDs: map[string]struct{}{}, queue: newRetryQueue()}
+	observer := &Observer{config: config, seenIDs: map[string]struct{}{}, queue: newRetryQueue(), connect: connectAndSubscribe}
 	if config.Since != nil {
 		observer.lastSeen = *config.Since
 	}
@@ -153,6 +189,28 @@ const (
 	retryBackoff    = 250 * time.Millisecond
 	retryBackoffMax = 5 * time.Second
 )
+
+// defaultIdleTimeout is how long a subscription may receive no frame at all
+// before it is presumed dead: a half-open socket delivers neither data nor an
+// error, so the only signal that it is gone is the silence itself.  It sits well
+// above the ~10 s state-commit cadence, so a healthy relay never trips it, and
+// well below the multi-day silent window the 2026-11 outage ran for.
+const defaultIdleTimeout = 45 * time.Second
+
+// probeSlack widens the probe's since window past the idle deadline, so a
+// subscription that is merely between heartbeats is not mistaken for a dead one
+// at the window's edge.
+const probeSlack = 15 * time.Second
+
+// probeWindow is how far back a liveness-probe subscription asks: the idle
+// deadline plus probeSlack.  A disabled deadline falls back to the default, so a
+// probe is never asked to replay the whole relay.
+func probeWindow(idle time.Duration) time.Duration {
+	if idle <= 0 {
+		idle = defaultIdleTimeout
+	}
+	return idle + probeSlack
+}
 
 // maxAppRetries bounds how many times an application rejection is submitted
 // before the event is dropped, counting the receive loop's first attempt.  The
@@ -385,26 +443,57 @@ func (observer *Observer) resumePoint() (time.Time, string) {
 // session runs one connection.  Every fresh subscription asks for events since
 // the last one it actually processed, so anything published while disconnected
 // is delivered by the replay rather than lost.
+//
+// A session also arms an IdleTimeout: if not one frame arrives within it -- real
+// or probe -- the socket is presumed dead and the session returns an error.  Run
+// logs `session ended: …`, waits, and calls session again; because the fresh
+// subscription starts from the advanced cursor, that resubscribe is lossless
+// (this is what a manual restart proved during the 2026-11 outage).  A negative
+// IdleTimeout disables the deadline.
 func (observer *Observer) session(ctx context.Context) error {
 	observer.mu.Lock()
 	since := observer.lastSeen
 	kinds := append([]int(nil), observer.config.Kinds...)
+	probes := append([]int(nil), observer.config.ProbeKinds...)
 	observer.mu.Unlock()
 
-	filters := make([]nostr.Filter, 0, len(kinds))
+	// Probe kinds ride alongside the real ones so a subscription carrying no
+	// auction traffic still carries the validators' state commitments.  A kind
+	// named in both lists gets one filter.
+	real := map[int]bool{}
 	for _, kind := range kinds {
+		real[kind] = true
+	}
+	subscribed := map[int]bool{}
+	filters := make([]nostr.Filter, 0, len(kinds)+len(probes))
+	for _, kind := range append(append([]int(nil), kinds...), probes...) {
+		if subscribed[kind] {
+			continue
+		}
+		subscribed[kind] = true
 		filter := nostr.Filter{Kinds: []int{kind}}
-		if !since.IsZero() {
-			// One second of slack so an event created in the same second as
-			// the last one seen is not skipped by the boundary.
-			stamp := nostr.Timestamp(since.Unix() - 1)
+		if real[kind] {
+			if !since.IsZero() {
+				// One second of slack so an event created in the same second as
+				// the last one seen is not skipped by the boundary.
+				stamp := nostr.Timestamp(since.Unix() - 1)
+				filter.Since = &stamp
+			}
+		} else {
+			// A probe is anchored near now, never at the durable cursor: the
+			// cursor can sit hours or days behind while no auction traffic
+			// arrives, and replaying every state commitment since then would
+			// flood the session and delay the real events it exists to carry.
+			// A window a little wider than the idle deadline still proves the
+			// socket is moving bytes, and bounds the replay to that window.
+			stamp := nostr.Timestamp(time.Now().Add(-probeWindow(observer.config.IdleTimeout)).Unix())
 			filter.Since = &stamp
 		}
 		filters = append(filters, filter)
 	}
 
-	observer.config.Logger.Printf("relay observer: subscribing to %s since=%s kinds=%v", observer.config.URL, describeSince(since), kinds)
-	subscription, err := connectAndSubscribe(ctx, observer.config.URL, filters)
+	observer.config.Logger.Printf("relay observer: subscribing to %s since=%s kinds=%v probe=%v", observer.config.URL, describeSince(since), kinds, probes)
+	subscription, err := observer.connect(ctx, observer.config.URL, filters)
 	if err != nil {
 		return err
 	}
@@ -414,16 +503,36 @@ func (observer *Observer) session(ctx context.Context) error {
 		subscription.Close()
 	}()
 
+	idle := observer.config.IdleTimeout
+	var timer *time.Timer
+	var idleC <-chan time.Time
+	if idle > 0 {
+		timer = time.NewTimer(idle)
+		idleC = timer.C
+		defer timer.Stop()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-idleC:
+			return fmt.Errorf("subscription to %s idle for %s; resubscribing", observer.config.URL, idle)
 		case event, ok := <-subscription.Events:
 			if !ok {
 				return subscription.CloseReason()
 			}
 			if event == nil {
 				continue
+			}
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(idle)
 			}
 			observer.handle(ctx, event)
 		}
@@ -434,7 +543,19 @@ func (observer *Observer) session(ctx context.Context) error {
 // a crash: a hostile or malformed event must not take a validator's observer
 // down, and the chain would reject it anyway.
 func (observer *Observer) handle(ctx context.Context, event *nostr.Event) {
+	// Every frame that reaches this function -- a real kind or a probe -- is
+	// proof the socket is still carrying bytes, so the last-frame time is
+	// recorded before anything can drop the event.
+	observer.recordFrame()
 	signed := toChainEvent(event)
+	if observer.probeKind(signed.Kind) {
+		// A liveness frame: the relay already stores every validator's state
+		// commitment, so one arriving is the round trip that keeps the session
+		// alive.  It is never submitted, never enters the id de-dupe set, and
+		// never advances the cursor, which is what keeps it free of any chain
+		// effect.  (It must not be logged as an unsupported kind either.)
+		return
+	}
 	// The same gate decodeTx applies: canonical serializer + Schnorr verify.
 	// Verifying here means a relay can forward garbage cheaply without ever
 	// reaching this node's mempool.
@@ -484,6 +605,23 @@ func (observer *Observer) handle(ctx context.Context, event *nostr.Event) {
 		return
 	}
 	observer.committed(signed, result, false)
+}
+
+// probeKind reports whether kind is subscribed only for liveness: named in
+// ProbeKinds and not in Kinds.  Such an event is proof the socket is alive but
+// has no chain effect, so handle() records the frame and returns.
+func (observer *Observer) probeKind(kind int) bool {
+	for _, real := range observer.config.Kinds {
+		if real == kind {
+			return false
+		}
+	}
+	for _, probe := range observer.config.ProbeKinds {
+		if probe == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // workerRunning reports whether the retry worker is live; without it a
@@ -582,11 +720,14 @@ func cursorAfter(a, b cursorEntry) bool {
 }
 
 // Stats reports how many events this observer committed, the newest created_at
-// it has seen, and the last transport error; readiness probes and tests use them.
-func (observer *Observer) Stats() (submitted int, lastSeen time.Time, lastError error) {
+// it has seen, the last instant any frame arrived (real kind or probe), and the
+// last transport error; readiness probes and tests use them.  A lastFrame that
+// stops advancing while Subscribed() is true is exactly the half-open socket
+// the idle deadline tears down.
+func (observer *Observer) Stats() (submitted int, lastSeen time.Time, lastFrame time.Time, lastError error) {
 	observer.mu.Lock()
 	defer observer.mu.Unlock()
-	return observer.submitted, observer.lastSeen, observer.lastError
+	return observer.submitted, observer.lastSeen, observer.lastFrame, observer.lastError
 }
 
 // Dropped reports how many events were terminally rejected and dropped.
@@ -616,6 +757,15 @@ func (observer *Observer) Subscribed() bool {
 func (observer *Observer) setSubscribed(value bool) {
 	observer.mu.Lock()
 	observer.subscribed = value
+	observer.mu.Unlock()
+}
+
+// recordFrame stamps the last-frame time: the instant any event -- real kind or
+// probe -- was received.  It is separate from lastSeen (the newest created_at
+// committed), so a subscription carrying only probes still shows it is alive.
+func (observer *Observer) recordFrame() {
+	observer.mu.Lock()
+	observer.lastFrame = time.Now()
 	observer.mu.Unlock()
 }
 
