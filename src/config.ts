@@ -30,6 +30,18 @@ export interface Config {
   estimatedSwapSeconds: number;
   /** Per-request HTTP timeout for mint and relay calls, ms. */
   requestTimeoutMs: number;
+  /** Fixed cadence of the liveness heartbeat line and state-file write, ms. */
+  heartbeatIntervalMs: number;
+  /**
+   * An observed kind-1451 outcome that has produced neither a kind-1452 nor a
+   * named terminal state for this long is a liveness alarm, seconds.
+   */
+  unsettledAlertAfterSec: number;
+  /**
+   * Where the heartbeat snapshot is written. `SF_STATE_FILE` overrides it; an
+   * empty string disables the state file (the log heartbeat still runs).
+   */
+  stateFile: string;
 }
 
 export const DEFAULT_CONFIG: Omit<Config, "mintUrl" | "relays" | "committeeGroupPubkey" | "validatorRoster"> = {
@@ -38,6 +50,9 @@ export const DEFAULT_CONFIG: Omit<Config, "mintUrl" | "relays" | "committeeGroup
   fallbackMarginSec: 60,
   estimatedSwapSeconds: 10,
   requestTimeoutMs: 15_000,
+  heartbeatIntervalMs: 60_000,
+  unsettledAlertAfterSec: 300,
+  stateFile: "",
 };
 
 export class ConfigError extends Error {
@@ -66,6 +81,14 @@ function posInt(value: unknown, field: string, fallback: number): number {
     throw new ConfigError(`${field} must be a non-negative integer`);
   }
   return value;
+}
+
+function clampInt(value: unknown, field: string, fallback: number, min: number, max: number): number {
+  const parsed = posInt(value, field, fallback);
+  if (parsed < min || parsed > max) {
+    throw new ConfigError(`${field} must be between ${min} and ${max}`);
+  }
+  return parsed;
 }
 
 /**
@@ -121,6 +144,11 @@ export function validateConfig(raw: unknown): Config {
     fallbackMarginSec: posInt(o.fallbackMarginSec, "fallbackMarginSec", DEFAULT_CONFIG.fallbackMarginSec),
     estimatedSwapSeconds: posInt(o.estimatedSwapSeconds, "estimatedSwapSeconds", DEFAULT_CONFIG.estimatedSwapSeconds),
     requestTimeoutMs: posInt(o.requestTimeoutMs, "requestTimeoutMs", DEFAULT_CONFIG.requestTimeoutMs),
+    // A zero/absurd interval would either spin or hide a dead process, so the
+    // heartbeat is constrained to one second … one hour.
+    heartbeatIntervalMs: clampInt(o.heartbeatIntervalMs, "heartbeatIntervalMs", DEFAULT_CONFIG.heartbeatIntervalMs, 1_000, 3_600_000),
+    unsettledAlertAfterSec: posInt(o.unsettledAlertAfterSec, "unsettledAlertAfterSec", DEFAULT_CONFIG.unsettledAlertAfterSec),
+    stateFile: typeof o.stateFile === "string" ? o.stateFile : DEFAULT_CONFIG.stateFile,
   };
 }
 

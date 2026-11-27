@@ -1,0 +1,14 @@
+[Unit]
+Description=Arena settlement facilitator liveness check
+Documentation=file:/opt/arena-settlement-facilitator/RUNBOOK.md
+After=arena-settlement-facilitator.service
+# A failed check raises the alarm unit, so a dead courier leaves a persistent
+# marker instead of only a journal line.
+OnFailure=arena-courier-alert.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/arena-settlement-facilitator
+Environment=SF_CONFIG=/etc/arena-settlement-facilitator/config.json
+Environment=SF_STATE_FILE=%S/arena-settlement-facilitator/state.json
+ExecStart=/home/%u/.bun/bin/bun scripts/courier-liveness.ts

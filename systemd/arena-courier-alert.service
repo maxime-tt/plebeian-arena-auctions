@@ -1,0 +1,8 @@
+[Unit]
+Description=Arena settlement facilitator liveness alarm
+Documentation=file:/opt/arena-settlement-facilitator/RUNBOOK.md
+
+[Service]
+Type=oneshot
+Environment=SF_ALERT_FILE=%S/arena-settlement-facilitator/ALERT
+ExecStart=/bin/sh -c 'msg="ALERT arena settlement facilitator liveness check FAILED at $(date -Is) — see journalctl --user -u arena-courier-liveness"; echo "$msg"; mkdir -p "$(dirname "$SF_ALERT_FILE")"; echo "$msg" >> "$SF_ALERT_FILE"'

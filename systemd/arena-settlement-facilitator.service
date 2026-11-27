@@ -12,13 +12,20 @@ Environment=SF_CONFIG=/etc/arena-settlement-facilitator/config.json
 # authoritative, so leaving it unset (ephemeral key) is fine.
 # EnvironmentFile=-/etc/arena-settlement-facilitator/env
 ExecStart=/home/%u/.bun/bin/bun src/index.ts
-Restart=on-failure
+# ALWAYS, not on-failure: the 2026-11-24 incident was a clean exit (status 0),
+# which `on-failure` does not restart. A signalled shutdown exits 130/143 by
+# contract (src/index.ts), and this unit restarts it regardless.
+Restart=always
 RestartSec=5
+# The heartbeat snapshot the liveness monitor reads; %S is the user state dir.
+StateDirectory=arena-settlement-facilitator
+StateDirectoryMode=0750
+Environment=SF_STATE_FILE=%S/arena-settlement-facilitator/state.json
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=
+ReadWritePaths=%S/arena-settlement-facilitator
 
 [Install]
 WantedBy=default.target

@@ -11,7 +11,17 @@
 import { SimplePool, generateSecretKey, nip19 } from "nostr-tools";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { pointFromHex, verifyDLEQProof } from "@cashu/cashu-ts";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
+import {
+  isTerminalOutcomeState,
+  LIVENESS_SCHEMA,
+  type LivenessCounts,
+  type LivenessOutcome,
+  type LivenessOutcomeState,
+  type LivenessState,
+} from "./liveness.ts";
 import { anchorRefusal, subscribeCommittee, subscribeCommitments, verifyCommitteeSignature } from "./relay.ts";
 import { planSwap, buildSwapBody, matchSignatures } from "./swap.ts";
 import { isAlreadySpent, getMintInfo, getMintKeys, postSwap } from "./mint.ts";
@@ -84,6 +94,14 @@ class Facilitator {
    * commitment re-checks them.
    */
   private readonly pendingAnchors = new Map<string, NostrEvent>();
+  /**
+   * One record per witnessed `(bid, outcome)` move: the liveness truth a monitor
+   * judges. Terminal states are kept for the counts; they never alert.
+   */
+  private readonly outcomes = new Map<string, LivenessOutcome>();
+  private readonly startedAtMs = Date.now();
+  private lastCarrierAtMs: number | null = null;
+  private heartbeatTimer: Timer | null = null;
 
   constructor(
     private readonly cfg: Config,
@@ -100,12 +118,113 @@ class Facilitator {
       this.onCommitment(ev);
     });
     log("facilitator watching", this.cfg.relays.join(","), "mint", this.cfg.mintUrl);
+    // The fixed-cadence signal: a state file a monitor can judge and a log line
+    // an operator can see. It runs whether or not any 1451 needs work, so
+    // "nothing to settle" can never be mistaken for "not running".
+    this.emitHeartbeat();
+    this.heartbeatTimer = setInterval(() => this.emitHeartbeat(), this.cfg.heartbeatIntervalMs);
+    this.heartbeatTimer.unref?.();
     return {
       close: () => {
+        if (this.heartbeatTimer !== null) {
+          clearInterval(this.heartbeatTimer);
+          this.heartbeatTimer = null;
+        }
         committeeSub.close();
         commitmentSub.close();
       },
     };
+  }
+
+  /**
+   * Record where one witnessed move stands. `firstSeenAtMs` is preserved across
+   * updates, so the monitor measures "outstanding since" from the first sighting,
+   * not from the last retry.
+   */
+  private noteOutcome(
+    content: CommitteeSignatureContent,
+    eventId: string,
+    state: LivenessOutcomeState,
+    detail?: string,
+  ): void {
+    const key = `${content.bid}|${content.outcome}`;
+    const previous = this.outcomes.get(key);
+    const now = Date.now();
+    this.outcomes.set(key, {
+      bid: content.bid,
+      outcome: content.outcome,
+      eventId,
+      auction: content.auction,
+      state,
+      firstSeenAtMs: previous?.firstSeenAtMs ?? now,
+      updatedAtMs: now,
+      ...(detail === undefined ? {} : { detail }),
+    });
+  }
+
+  /** The snapshot written on every heartbeat; see `src/liveness.ts`. */
+  private snapshot(nowMs: number): LivenessState {
+    const observed = [...this.outcomes.values()];
+    const outstanding = observed.filter((move) => !isTerminalOutcomeState(move.state));
+    const counts: LivenessCounts = {
+      witnessed: observed.length,
+      published: observed.filter((move) => move.state === "published").length,
+      alreadySpent: observed.filter((move) => move.state === "already-spent").length,
+      declined: observed.filter((move) => move.state === "declined").length,
+      failed: observed.filter((move) => move.state === "failed").length,
+      open: outstanding.length,
+    };
+    const chain = chainTimeFromCommitments(this.commitments);
+    return {
+      schema: LIVENESS_SCHEMA,
+      pid: process.pid,
+      startedAtMs: this.startedAtMs,
+      heartbeatAtMs: nowMs,
+      heartbeatIntervalMs: this.cfg.heartbeatIntervalMs,
+      unsettledAlertAfterSec: this.cfg.unsettledAlertAfterSec,
+      chainHeight: chain === null ? null : chain.height,
+      commitmentsSeen: this.commitments.length,
+      pendingAnchors: this.pendingAnchors.size,
+      processing: this.processing.size,
+      lastCarrierAtMs: this.lastCarrierAtMs,
+      relays: [...this.cfg.relays],
+      mintUrl: this.cfg.mintUrl,
+      counts,
+      outstanding,
+    };
+  }
+
+  /**
+   * One heartbeat line on a fixed cadence, plus the atomic state-file write.
+   * `SF_STATE_FILE` (even empty, to disable) overrides `config.stateFile`.
+   */
+  private emitHeartbeat(): void {
+    const now = Date.now();
+    const state = this.snapshot(now);
+    const up = Math.round((now - this.startedAtMs) / 1000);
+    const oldest = state.outstanding.reduce((max, move) => Math.max(max, now - move.firstSeenAtMs), 0);
+    const lastCarrier =
+      state.lastCarrierAtMs === null ? "--" : `${Math.round((now - state.lastCarrierAtMs) / 1000)}s_ago`;
+    log(
+      `heartbeat up=${up}s chain=${state.chainHeight ?? "--"} commitments=${state.commitmentsSeen}`,
+      `pending_anchor=${state.pendingAnchors} processing=${state.processing}`,
+      `open=${state.counts.open} published=${state.counts.published} spent=${state.counts.alreadySpent}`,
+      `declined=${state.counts.declined} failed=${state.counts.failed}`,
+      `oldest_outstanding=${Math.round(oldest / 1000)}s last_carrier=${lastCarrier}`,
+    );
+    const path = process.env.SF_STATE_FILE ?? this.cfg.stateFile;
+    if (path !== "") void this.writeStateFile(path, state);
+  }
+
+  private async writeStateFile(path: string, state: LivenessState): Promise<void> {
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      const tmp = `${path}.tmp.${process.pid}`;
+      await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+      await rename(tmp, path);
+    } catch (err) {
+      log("state write failed:", (err as Error).message);
+    }
   }
 
   private onCommitment(ev: NostrEvent): void {
@@ -143,37 +262,48 @@ class Facilitator {
         // Not WRONG, just not yet provable: our own committed view lags the coordinator's by a
         // block or so. Keep it and re-check on the next commitment.
         this.pendingAnchors.set(`${content.bid}|${content.outcome}`, ev);
+        this.noteOutcome(content, ev.id, "pending-anchor", anchor);
         return;
       }
       log("drop 1451:", anchor);
+      this.noteOutcome(content, ev.id, "declined", anchor);
       return;
     }
-    if (this.processing.has(key)) return;
+    if (this.processing.has(key)) {
+      this.noteOutcome(content, ev.id, "processing");
+      return;
+    }
 
     const cached = this.completed.get(key);
     if (cached) {
-      await this.publishCarrier(cached, "repeat");
+      const published = await this.publishCarrier(cached, "repeat");
+      this.noteOutcome(content, ev.id, published ? "published" : "failed", published ? undefined : "carrier publish reached no relay");
       return;
     }
 
     this.processing.add(key);
+    this.noteOutcome(content, ev.id, "processing");
     try {
-      await this.settle(content);
+      const result = await this.settle(content);
+      this.noteOutcome(content, ev.id, result.state, result.detail);
+    } catch (err) {
+      this.noteOutcome(content, ev.id, "failed", (err as Error).message);
+      throw err;
     } finally {
       this.processing.delete(key);
     }
   }
 
-  private async settle(committee: CommitteeSignatureContent): Promise<void> {
+  private async settle(committee: CommitteeSignatureContent): Promise<{ state: LivenessOutcomeState; detail?: string }> {
     const bid = await fetchBid(this.pool, this.cfg.relays, committee.bid);
     if (!bid) {
       log(`no bid ${committee.bid} on the relay; skipping`);
-      return;
+      return { state: "failed", detail: `no bid ${committee.bid.slice(0, 16)}… on the relay; nothing retries it` };
     }
     const create = await fetchCreate(this.pool, this.cfg.relays, committee.auction);
     if (!create) {
       log(`no create ${committee.auction} on the relay; skipping`);
-      return;
+      return { state: "failed", detail: `no create ${committee.auction} on the relay; nothing retries it` };
     }
 
     const planned = planSwap({
@@ -184,14 +314,14 @@ class Facilitator {
     });
     if (!planned.ok) {
       log(`decline ${committee.bid} ${committee.outcome}:`, planned.reason);
-      return;
+      return { state: "declined", detail: planned.reason };
     }
     const plan = planned.plan;
 
     const refusal = await this.deadlineRefusalFor(plan.locktime);
     if (refusal) {
       log(`decline ${committee.bid} ${committee.outcome}:`, refusal);
-      return;
+      return { state: "declined", detail: refusal };
     }
 
     let signatures;
@@ -206,10 +336,10 @@ class Facilitator {
         // recipient) already executed. Nothing to publish from here; the
         // chain's own receipt is the primary source.
         log(`${committee.bid} ${committee.outcome}: input already spent; nothing to do`);
-        return;
+        return { state: "already-spent" };
       }
       log(`swap failed for ${committee.bid} ${committee.outcome}:`, (err as Error).message);
-      return;
+      return { state: "failed", detail: `swap failed: ${(err as Error).message}` };
     }
 
     const keys = await this.keysFor(plan.outputs.map((o) => o.id));
@@ -235,13 +365,19 @@ class Facilitator {
       const proofs = unblindToReceipts(plan, matched, keys);
       carrier = buildCarrier(committee, proofs);
     } catch (err) {
-      if (err instanceof SettlementRefusal) log(`decline ${committee.bid}: ${err.message}`);
-      else log(`unblind error for ${committee.bid}:`, (err as Error).message);
-      return;
+      if (err instanceof SettlementRefusal) {
+        log(`decline ${committee.bid}: ${err.message}`);
+        return { state: "declined", detail: err.message };
+      }
+      log(`unblind error for ${committee.bid}:`, (err as Error).message);
+      return { state: "failed", detail: `unblind failed: ${(err as Error).message}` };
     }
 
     this.completed.set(`${committee.bid}|${committee.outcome}`, carrier);
-    await this.publishCarrier(carrier, "settle");
+    const published = await this.publishCarrier(carrier, "settle");
+    return published
+      ? { state: "published" }
+      : { state: "failed", detail: "carrier publish reached no relay" };
   }
 
   private async deadlineRefusalFor(locktime: number): Promise<string | null> {
@@ -280,14 +416,17 @@ class Facilitator {
     return keys;
   }
 
-  private async publishCarrier(carrier: SettlementCarrierContent, why: string): Promise<void> {
+  private async publishCarrier(carrier: SettlementCarrierContent, why: string): Promise<boolean> {
     const event = buildCarrierEvent(this.sk, carrier, Math.floor(Date.now() / 1000));
     try {
       const results = await Promise.allSettled(this.pool.publish(this.cfg.relays, event));
       const ok = results.filter((r) => r.status === "fulfilled").length;
       log(`${why}: published 1452 ${event.id} for ${carrier.bid} to ${ok}/${this.cfg.relays.length} relays`);
+      if (ok > 0) this.lastCarrierAtMs = Date.now();
+      return ok > 0;
     } catch (err) {
       log(`1452 publish failed for ${carrier.bid}:`, (err as Error).message);
+      return false;
     }
   }
 }
@@ -300,20 +439,40 @@ async function main(): Promise<void> {
   const facilitator = new Facilitator(cfg, pool, sk);
   const handle = facilitator.start();
   if (process.env.SF_ONCE === "1") {
+    // Diagnostic one-shot mode only: exits 0 by design, so it must never be
+    // placed under a `Restart=always` unit (it would loop forever).
     setTimeout(() => {
       handle.close();
       pool.close([]);
       process.exit(0);
     }, 2_000);
   }
-  const stop = () => {
-    log("shutting down");
+  /**
+   * Exit codes are a contract, not a convenience:
+   *   0   — `SF_ONCE` diagnostic run completed (never a supervised exit)
+   *   1   — fatal startup/dispatch error
+   *   130 — SIGINT  (128 + 2)
+   *   143 — SIGTERM (128 + 15)
+   * A signalled shutdown deliberately does NOT exit 0, so a supervisor that
+   * only restarts failures cannot silently leave the courier dead (the
+   * 2026-11-24 incident). The unit also uses `Restart=always`.
+   */
+  const stop = (code: number, signal: string) => {
+    log(`shutting down (${signal}) exit=${code}`);
     handle.close();
     pool.close([]);
-    process.exit(0);
+    process.exit(code);
   };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  process.on("SIGINT", () => stop(130, "SIGINT"));
+  process.on("SIGTERM", () => stop(143, "SIGTERM"));
+  // A rejection nobody awaited must not leave a half-dead courier under a
+  // supervisor that ignores exit 0; surface it as a fatal exit 1.
+  process.on("unhandledRejection", (reason) => {
+    log("fatal: unhandled rejection:", reason instanceof Error ? reason.message : String(reason));
+    handle.close();
+    pool.close([]);
+    process.exit(1);
+  });
 }
 
 if (import.meta.main) {

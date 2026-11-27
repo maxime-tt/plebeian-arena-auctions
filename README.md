@@ -58,6 +58,44 @@ key is fine.
 | `fallbackMarginSec` | margin applied when the local wall clock is the only clock |
 | `estimatedSwapSeconds` | assumed swap round-trip cost |
 | `requestTimeoutMs` | per-request HTTP timeout |
+| `heartbeatIntervalMs` | fixed cadence of the heartbeat log line + state-file write (60 s) |
+| `unsettledAlertAfterSec` | a witnessed 1451 with no 1452 for this long is an alarm (300 s) |
+| `stateFile` | heartbeat snapshot path; `SF_STATE_FILE` overrides, empty disables |
+
+## Liveness
+
+The process emits a fixed-cadence line, every `heartbeatIntervalMs`, whether or not
+there is anything to settle:
+
+```
+2026-11-27T10:20:00.000Z heartbeat up=60s chain=14521 commitments=12 pending_anchor=0 processing=0 open=0 published=5 spent=3 declined=4 failed=0 oldest_outstanding=0s last_carrier=15s_ago
+```
+
+and, when `stateFile`/`SF_STATE_FILE` is set, atomically writes the same facts as
+JSON (`arena.facilitator.liveness.v1`). `open` counts witnessed 1451s that have
+reached neither a kind-1452 carrier nor a named terminal state; each carries the
+time it was first seen, so a monitor can detect
+**"an outstanding 1451 with no 1452 for N minutes"** directly.
+
+`scripts/courier-liveness.ts` is that monitor (no network): it fails (exit 1, line
+prefixed `ALERT`) when the state file is unreadable, the pid is gone, the heartbeat
+is older than `max(3 × interval, 90 s)`, or an outstanding move is older than
+`unsettledAlertAfterSec`. `systemd/arena-courier-liveness.timer` runs it every
+minute, and `systemd/arena-courier-alert.service` (via `OnFailure=`) appends a
+persistent `ALERT` marker.
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | `SF_ONCE=1` diagnostic run completed (never a supervised exit) |
+| `1` | fatal startup/dispatch error, or an unhandled rejection |
+| `130` | SIGINT |
+| `143` | SIGTERM |
+
+A signalled shutdown deliberately exits **non-zero**, and the unit uses
+`Restart=always`, so neither a clean nor a signalled exit can leave the courier
+dead unnoticed (the 2026-11-24 incident: exit status 0 under `Restart=on-failure`).
 
 ## Run
 
@@ -98,5 +136,8 @@ src/clock.ts    chain/mint clock and the locktime deadline
 src/swap.ts     plan + verify + build the /v1/swap body; match the response
 src/mint.ts     GET /v1/info, GET /v1/keys, POST /v1/swap
 src/settle.ts   unblind + DLEQ verify + the 1452 carrier
+src/liveness.ts heartbeat snapshot shape + the pure monitor check
 src/index.ts    the run loop
+scripts/courier-liveness.ts  the no-network liveness monitor
+systemd/        the service, the liveness timer and the alert unit
 ```

@@ -11,5 +11,8 @@
   "clockToleranceSec": 30,
   "fallbackMarginSec": 60,
   "estimatedSwapSeconds": 10,
-  "requestTimeoutMs": 15000
+  "requestTimeoutMs": 15000,
+  "heartbeatIntervalMs": 60000,
+  "unsettledAlertAfterSec": 300,
+  "stateFile": ""
 }
